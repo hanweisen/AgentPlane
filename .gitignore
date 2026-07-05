@@ -1,0 +1,14 @@
+target/
+dist/
+.DS_Store
+.cargo-home/
+.cargo-home-rustup/
+.cargo-target/
+.cargo-target-rustup/
+
+# Local editor and agent state
+.zed/
+.codex/
+.claude/
+.opencode/
+CLAUDE.local.md

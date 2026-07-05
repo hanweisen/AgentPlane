@@ -1,0 +1,201 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessStartRequest {
+    pub remote_root: String,
+    pub process_id: String,
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: Option<std::collections::BTreeMap<String, Option<String>>>,
+    pub timeout_seconds: Option<u64>,
+    pub output_bytes_limit: Option<usize>,
+    pub pipe_stdin: bool,
+    #[serde(default)]
+    pub kill_tree_on_terminate: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProcessStartConfig<'a> {
+    remote_root: &'a str,
+    cwd: &'a str,
+    command: &'a [String],
+    pipe_stdin: bool,
+    kill_tree_on_terminate: bool,
+    timeout_seconds: Option<u64>,
+    output_bytes_limit: usize,
+}
+
+impl<'a> ProcessStartConfig<'a> {
+    pub(crate) fn new(
+        remote_root: &'a str,
+        cwd: &'a str,
+        command: &'a [String],
+        pipe_stdin: bool,
+        kill_tree_on_terminate: bool,
+        timeout_seconds: Option<u64>,
+        output_bytes_limit: usize,
+    ) -> Self {
+        Self {
+            remote_root,
+            cwd,
+            command,
+            pipe_stdin,
+            kill_tree_on_terminate,
+            timeout_seconds,
+            output_bytes_limit,
+        }
+    }
+}
+
+impl ProcessStartRequest {
+    pub(crate) fn matches_existing_normalized_config(
+        &self,
+        existing: &ProcessStartConfig<'_>,
+        remote_root: &str,
+        cwd: &str,
+        output_bytes_limit: usize,
+        kill_tree_on_terminate: bool,
+    ) -> bool {
+        existing.remote_root == remote_root
+            && existing.cwd == cwd
+            && existing.command == self.command.as_slice()
+            && existing.pipe_stdin == self.pipe_stdin
+            && existing.kill_tree_on_terminate == kill_tree_on_terminate
+            && existing.timeout_seconds == self.timeout_seconds
+            && existing.output_bytes_limit == output_bytes_limit
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessStartResponse {
+    pub ok: bool,
+    pub process_id: String,
+    pub created: bool,
+    pub already_exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessGetRequest {
+    pub process_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessGetResponse {
+    pub ok: bool,
+    pub process: ProcessInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessListResponse {
+    pub ok: bool,
+    pub processes: Vec<ProcessInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessInfo {
+    pub process_id: String,
+    pub remote_root: String,
+    pub cwd: String,
+    pub command: Vec<String>,
+    pub pipe_stdin: bool,
+    pub kill_tree_on_terminate: bool,
+    pub process_group_id: Option<i32>,
+    #[serde(default)]
+    pub children_running: bool,
+    pub timeout_seconds: Option<u64>,
+    pub output_bytes_limit: usize,
+    pub started_at_unix_ms: u128,
+    pub finished_at_unix_ms: Option<u128>,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+    pub failure: Option<String>,
+    pub next_seq: u64,
+    pub available_from_seq: u64,
+    pub truncated: bool,
+    pub output_retained: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessReadRequest {
+    pub process_id: String,
+    pub after_seq: Option<u64>,
+    pub max_bytes: Option<usize>,
+    pub wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessReadResponse {
+    pub ok: bool,
+    pub process_id: String,
+    pub chunks: Vec<ProcessOutputChunk>,
+    pub next_seq: u64,
+    pub available_from_seq: u64,
+    pub cursor_expired: bool,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+    pub truncated: bool,
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessOutputChunk {
+    pub seq: u64,
+    pub stream: ProcessOutputStream,
+    pub data_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessWriteRequest {
+    pub process_id: String,
+    pub data_b64: String,
+    pub close_stdin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessTerminateRequest {
+    pub process_id: String,
+    #[serde(default)]
+    pub tree: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessCleanupRequest {
+    pub process_match: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub kill: bool,
+    #[serde(default)]
+    pub signal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessCleanupResponse {
+    pub ok: bool,
+    pub dry_run: bool,
+    pub signal: Option<String>,
+    pub matched: Vec<CleanupProcess>,
+    pub signaled: Vec<CleanupProcess>,
+    pub skipped: Vec<CleanupProcess>,
+    pub agent_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CleanupProcess {
+    pub pid: i32,
+    pub ppid: Option<i32>,
+    pub process_group_id: Option<i32>,
+    pub session_id: Option<i32>,
+    pub elapsed: Option<String>,
+    pub stat: Option<String>,
+    pub user: Option<String>,
+    pub command: Option<String>,
+    pub skip_reason: Option<String>,
+}

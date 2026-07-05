@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: "AgentPlane"
+  short_description: "Operate remote containers, proxies, and GPU leases"
+  default_prompt: "Use $agentplane to operate a remote container through agentplane, either by direct server access, through a Gateway or path-based gateway URL with custom headers, or with explicit shared-mode GPU leases."
