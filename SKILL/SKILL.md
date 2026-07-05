@@ -1,12 +1,12 @@
 ---
 name: agentplane
-description: Operate a remote container for build, test, inference, file editing, long-lived process sessions, and optional multi-agent GPU lease workflows via `agentplane`. Use this when the workflow is "edit locally, run remotely" against either a direct AgentPlane server or a path-based gateway URL that also requires custom gateway headers.
+description: Operate a remote machine, container, or shared workspace for build, test, inference, file editing, long-lived process sessions, and optional multi-agent GPU lease workflows via `agentplane`. Use this when the workflow is "edit locally, run remotely" against either a direct AgentPlane server or a path-based gateway URL that also requires custom gateway headers.
 ---
 
 # AgentPlane
 
-Use this skill when the user wants Codex to operate a remote container while keeping a
-local checkout as the source of truth.
+Use this skill when the user wants Codex to operate a remote machine, container, or shared
+workspace while keeping a local checkout as the source of truth.
 
 This skill supports two **access modes**. Pick exactly one before any remote operation:
 
@@ -120,7 +120,7 @@ Use **Gateway mode** when the user gives:
 
 - a routed service URL
 - a representative browser `curl` request
-- a cookie string
+- required custom request headers
 - or any evidence that a gateway redirects unauthenticated requests to login
 
 After choosing, set:
@@ -725,7 +725,7 @@ curl -sS -D /tmp/agentplane.headers -o /tmp/agentplane.body \
 Interpretation:
 
 - `200 {"ok":true,...}`: gateway path is correct
-- `302` to OIDC or login: cookie or referer is missing, stale, or wrong
+- `302` to OIDC or login: required request context is missing, stale, or wrong
 - `404`: wrong routed service URL
 
 ### Gateway requests
@@ -1058,7 +1058,7 @@ This is independent from the local shell proxy issue.
 
 - keep the local repo as the only human-edited source of truth
 - do not silently widen `--allow-root` or `AP_REMOTE_ROOT`
-- treat token and cookie values as secrets
+- treat tokens and custom request headers as secrets
 - never guess or brute-force missing secrets or endpoint details (`AP_TOKEN`, service
   port/root). If the user did not provide them, ask. Confirming a user-supplied URL with one
   `health` probe is verification; trying multiple token values or scanning ports to discover

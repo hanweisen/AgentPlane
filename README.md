@@ -71,6 +71,70 @@ remote machine running agentplane server
 allowed remote workspace roots
 ```
 
+## Agent Quick Start
+
+Use this flow when Codex, Claude Code, or another agent should edit locally and run on a
+remote machine.
+
+### 1. Deploy The Server
+
+On the remote machine, pick an existing parent directory that may contain remote projects:
+
+```bash
+REMOTE_IP=$(hostname -I | awk '{print $1}')
+TOKEN='replace-with-random-token'
+ALLOW_ROOT='/workspace'
+REMOTE_ROOT='/workspace/project'
+
+mkdir -p "$ALLOW_ROOT"
+echo "AgentPlane server: http://$REMOTE_IP:8765"
+echo "Remote root: $REMOTE_ROOT"
+
+./agentplane server \
+  --listen 0.0.0.0 \
+  --port 8765 \
+  --allow-root "$ALLOW_ROOT" \
+  --token "$TOKEN"
+```
+
+`REMOTE_ROOT` may be a new project directory. AgentPlane can create it during sync as long
+as it is under `ALLOW_ROOT`.
+
+### 2. Tell The Agent To Load The Skill
+
+Use this prompt:
+
+```text
+Load the AgentPlane skill from this repository's SKILL/ directory.
+Use AgentPlane for remote sync, command execution, file operations, process lifecycle,
+GPU checks when available, and shared lease workflows when needed.
+```
+
+### 3. Give The Agent The Environment
+
+Use this prompt:
+
+```text
+AgentPlane server: http://<REMOTE_IP>:8765
+AgentPlane token: <TOKEN>
+Remote root: /workspace/project
+Local repo: /path/to/local/repo
+
+Create a local profile at /tmp/agentplane.env with AP_SERVER, AP_TOKEN, and AP_REMOTE_ROOT.
+Then sync the local repo to the remote root and run cargo test.
+```
+
+The profile is a local secret. Do not commit it.
+
+The agent will typically initialize the remote project with:
+
+```bash
+agentplane --profile /tmp/agentplane.env sync-run \
+  --repo /path/to/local/repo \
+  --ref HEAD \
+  --command 'cargo test'
+```
+
 ## Quick Start
 
 ### Install
@@ -464,19 +528,6 @@ src/protocol/  Request and response DTOs
 tests/         End-to-end and integration tests
 SKILL/         Optional agent-facing operating instructions
 ```
-
-## Contributing
-
-Issues and pull requests are welcome. Before opening a PR, run:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-```
-
-Please keep user-facing CLI help, protocol structs, README examples, and `SKILL/` aligned
-when a change affects behavior.
 
 ## Current Limits
 
