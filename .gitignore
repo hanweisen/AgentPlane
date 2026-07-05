@@ -5,6 +5,7 @@ dist/
 .cargo-home-rustup/
 .cargo-target/
 .cargo-target-rustup/
+.cargo/config.toml
 
 # Local editor and agent state
 .zed/

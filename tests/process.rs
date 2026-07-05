@@ -991,7 +991,7 @@ fn cli_process_run_warns_when_output_cursor_expires() -> Result<()> {
         ],
     )?;
 
-    let command = "for i in $(seq 1 200); do printf 'line-%05d\\n' \"$i\"; done";
+    let command = "for i in $(seq 1 20); do printf 'line-%05d-%080d\\n' \"$i\" 0; sleep 0.02; done";
     let started = run_cli(&[
         "process-start",
         "--server",
@@ -1014,7 +1014,38 @@ fn cli_process_run_warns_when_output_cursor_expires() -> Result<()> {
         "stderr: {}",
         String::from_utf8_lossy(&started.stderr)
     );
-    std::thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut cursor_expired = false;
+    while Instant::now() < deadline {
+        let read = run_cli(&[
+            "process-read",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--process-id",
+            "cli-process-run-expired-cursor",
+            "--after-seq",
+            "0",
+            "--max-bytes",
+            "64",
+        ])?;
+        assert!(
+            read.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&read.stdout)?;
+        if body["cursor_expired"].as_bool() == Some(true) {
+            cursor_expired = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        cursor_expired,
+        "process output cursor did not expire before process-run"
+    );
 
     let output = run_cli(&[
         "process-run",
