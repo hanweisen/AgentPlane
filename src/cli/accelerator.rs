@@ -410,7 +410,10 @@ fn build_accelerator_readiness_report(
             None => blockers.push(device_blocker(
                 "memory_unknown",
                 device.index,
-                format!("{accelerator_label} {} memory usage is unknown", device.index),
+                format!(
+                    "{accelerator_label} {} memory usage is unknown",
+                    device.index
+                ),
                 None,
                 Some(policy.max_memory_mib),
                 device.utilization_percent,
@@ -435,7 +438,10 @@ fn build_accelerator_readiness_report(
             None => blockers.push(device_blocker(
                 "utilization_unknown",
                 device.index,
-                format!("{accelerator_label} {} utilization is unknown", device.index),
+                format!(
+                    "{accelerator_label} {} utilization is unknown",
+                    device.index
+                ),
                 device.memory_used_mib,
                 Some(policy.max_memory_mib),
                 None,
