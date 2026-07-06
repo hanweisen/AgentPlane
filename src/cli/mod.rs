@@ -33,6 +33,7 @@ enum CommandKind {
     Server(ServerArgs),
     AcceleratorStatus(AcceleratorStatusArgs),
     GpuStatus(GpuStatusArgs),
+    NpuStatus(NpuStatusArgs),
     AcceleratorPreflight(AcceleratorPreflightArgs),
     GpuPreflight(GpuPreflightArgs),
     AcceleratorWaitIdle(AcceleratorWaitIdleArgs),
@@ -167,6 +168,8 @@ struct ServerArgs {
     default_kill_tree_on_terminate: bool,
     #[arg(long = "nvidia-smi-path")]
     nvidia_smi_path: Option<PathBuf>,
+    #[arg(long = "npu-smi-path")]
+    npu_smi_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -187,6 +190,20 @@ struct AcceleratorStatusArgs {
 
 #[derive(Debug, Args)]
 struct GpuStatusArgs {
+    #[command(flatten)]
+    auth: ClientAuthArgs,
+    #[arg(long = "gpus")]
+    gpus: Option<String>,
+    #[arg(long = "match")]
+    process_match: Option<String>,
+    #[arg(long = "json", default_value_t = false)]
+    json: bool,
+    #[arg(long = "text", default_value_t = false)]
+    text: bool,
+}
+
+#[derive(Debug, Args)]
+struct NpuStatusArgs {
     #[command(flatten)]
     auth: ClientAuthArgs,
     #[arg(long = "gpus")]
@@ -622,6 +639,7 @@ pub async fn run() -> Result<ExitCode> {
             accelerator::accelerator_status(args, &profile).await
         }
         CommandKind::GpuStatus(args) => accelerator::gpu_status(args, &profile).await,
+        CommandKind::NpuStatus(args) => accelerator::npu_status(args, &profile).await,
         CommandKind::AcceleratorPreflight(args) => {
             accelerator::accelerator_preflight(args, &profile).await
         }

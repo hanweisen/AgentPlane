@@ -40,7 +40,7 @@ pub(super) async fn server(args: ServerArgs) -> Result<ExitCode> {
             },
         },
     };
-    server_impl::serve_with_config_and_nvidia_smi(
+    server_impl::serve_with_config_and_accelerators(
         args.listen,
         args.port,
         args.allow_root,
@@ -48,6 +48,7 @@ pub(super) async fn server(args: ServerArgs) -> Result<ExitCode> {
         limits,
         tls,
         args.nvidia_smi_path,
+        args.npu_smi_path,
     )
     .await
 }

@@ -15,7 +15,7 @@ use crate::protocol::{
 
 use super::{
     AcceleratorKindArg, AcceleratorPreflightArgs, AcceleratorStatusArgs, AcceleratorWaitIdleArgs,
-    GpuPreflightArgs, GpuStatusArgs, GpuWaitIdleArgs,
+    GpuPreflightArgs, GpuStatusArgs, GpuWaitIdleArgs, NpuStatusArgs,
 };
 
 struct AcceleratorReadinessPolicy {
@@ -81,6 +81,18 @@ pub(super) async fn gpu_status(args: GpuStatusArgs, profile: &ClientProfile) -> 
     let auth = args.auth.resolve(profile)?;
     let payload = AcceleratorStatusRequest {
         kind: AcceleratorKind::Gpu,
+        gpus: args.gpus,
+        process_match: args.process_match,
+    };
+    let body = post_accelerator_status(&auth, &payload).await?;
+    print_accelerator_status(&body, args.text && !args.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(super) async fn npu_status(args: NpuStatusArgs, profile: &ClientProfile) -> Result<ExitCode> {
+    let auth = args.auth.resolve(profile)?;
+    let payload = AcceleratorStatusRequest {
+        kind: AcceleratorKind::Npu,
         gpus: args.gpus,
         process_match: args.process_match,
     };
@@ -289,14 +301,14 @@ fn print_accelerator_status(body: &AcceleratorStatusResponse, text: bool) -> Res
         body.provider.as_deref().unwrap_or("unknown")
     );
     for device in &body.devices {
-        print_accelerator_device(device);
+        print_accelerator_device(&body.kind, device);
     }
     if body.processes.is_empty() {
         println!("No accelerator compute processes reported.");
     } else {
         println!("Processes:");
         for process in &body.processes {
-            print_accelerator_process(process);
+            print_accelerator_process(&body.kind, process);
         }
     }
     Ok(())
@@ -337,6 +349,7 @@ fn build_accelerator_readiness_report(
     timed_out: bool,
 ) -> AcceleratorReadinessReport {
     let mut blockers = Vec::new();
+    let accelerator_label = accelerator_kind_label(&policy.kind);
     if !status.available {
         blockers.push(AcceleratorReadinessBlocker {
             kind: "accelerator_unavailable".to_string(),
@@ -366,7 +379,7 @@ fn build_accelerator_readiness_report(
             blockers.push(AcceleratorReadinessBlocker {
                 kind: "gpu_missing".to_string(),
                 gpu_index: Some(*index),
-                message: format!("GPU {index} was requested but not reported"),
+                message: format!("{accelerator_label} {index} was requested but not reported"),
                 memory_used_mib: None,
                 max_memory_mib: None,
                 utilization_percent: None,
@@ -386,7 +399,7 @@ fn build_accelerator_readiness_report(
                 "memory_above_threshold",
                 device.index,
                 format!(
-                    "GPU {} memory {}MiB exceeds {}MiB",
+                    "{accelerator_label} {} memory {}MiB exceeds {}MiB",
                     device.index, used, policy.max_memory_mib
                 ),
                 Some(used),
@@ -397,7 +410,7 @@ fn build_accelerator_readiness_report(
             None => blockers.push(device_blocker(
                 "memory_unknown",
                 device.index,
-                format!("GPU {} memory usage is unknown", device.index),
+                format!("{accelerator_label} {} memory usage is unknown", device.index),
                 None,
                 Some(policy.max_memory_mib),
                 device.utilization_percent,
@@ -411,7 +424,7 @@ fn build_accelerator_readiness_report(
                 "utilization_above_threshold",
                 device.index,
                 format!(
-                    "GPU {} utilization {}% exceeds {}%",
+                    "{accelerator_label} {} utilization {}% exceeds {}%",
                     device.index, util, policy.max_util_percent
                 ),
                 device.memory_used_mib,
@@ -422,7 +435,7 @@ fn build_accelerator_readiness_report(
             None => blockers.push(device_blocker(
                 "utilization_unknown",
                 device.index,
-                format!("GPU {} utilization is unknown", device.index),
+                format!("{accelerator_label} {} utilization is unknown", device.index),
                 device.memory_used_mib,
                 Some(policy.max_memory_mib),
                 None,
@@ -438,7 +451,10 @@ fn build_accelerator_readiness_report(
                 blockers.push(AcceleratorReadinessBlocker {
                     kind: "forbidden_process".to_string(),
                     gpu_index: process.gpu_index,
-                    message: format!("GPU process pid={} matches forbidden pattern", process.pid),
+                    message: format!(
+                        "{accelerator_label} process pid={} matches forbidden pattern",
+                        process.pid
+                    ),
                     memory_used_mib: None,
                     max_memory_mib: None,
                     utilization_percent: None,
@@ -500,7 +516,17 @@ fn readiness_agent_hint(status: &AcceleratorStatusResponse) -> String {
     if !status.available {
         return status.agent_hint.clone();
     }
-    "Use gpu-preflight before starting GPU workloads and gpu-wait-idle after stopping them; avoid hand-written GPU JSON polling unless custom policy is needed.".to_string()
+    let accelerator_label = accelerator_kind_label(&status.kind);
+    let (preflight_command, wait_command) = match status.kind {
+        AcceleratorKind::Gpu => ("gpu-preflight", "gpu-wait-idle"),
+        AcceleratorKind::Npu => (
+            "accelerator-preflight --kind npu",
+            "accelerator-wait-idle --kind npu",
+        ),
+    };
+    format!(
+        "Use {preflight_command} before starting {accelerator_label} workloads and {wait_command} after stopping them; avoid hand-written {accelerator_label} JSON polling unless custom policy is needed."
+    )
 }
 
 fn print_accelerator_readiness_report(
@@ -553,7 +579,7 @@ fn render_accelerator_blocker(blocker: &AcceleratorReadinessBlocker) -> String {
     let mut parts = Vec::new();
     parts.push(blocker.message.clone());
     if let Some(gpu) = blocker.gpu_index {
-        parts.push(format!("gpu={gpu}"));
+        parts.push(format!("device={gpu}"));
     }
     if let Some(used) = blocker.memory_used_mib {
         parts.push(format!("memory={used}MiB"));
@@ -630,9 +656,10 @@ fn accelerator_kind_label(kind: &AcceleratorKind) -> &'static str {
     }
 }
 
-fn print_accelerator_device(device: &AcceleratorDevice) {
+fn print_accelerator_device(kind: &AcceleratorKind, device: &AcceleratorDevice) {
     println!(
-        "GPU {}: {} memory={}MiB/{}MiB util={}%",
+        "{} {}: {} memory={}MiB/{}MiB util={}%",
+        accelerator_kind_label(kind),
         device.index,
         device.name,
         render_optional_u64(device.memory_used_mib),
@@ -641,10 +668,11 @@ fn print_accelerator_device(device: &AcceleratorDevice) {
     );
 }
 
-fn print_accelerator_process(process: &AcceleratorProcess) {
+fn print_accelerator_process(kind: &AcceleratorKind, process: &AcceleratorProcess) {
     println!(
-        "  pid={} gpu={} mem={}MiB cmd={}",
+        "  pid={} {}={} mem={}MiB cmd={}",
         process.pid,
+        accelerator_kind_label(kind).to_ascii_lowercase(),
         process
             .gpu_index
             .map(|index| index.to_string())

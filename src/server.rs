@@ -112,6 +112,7 @@ pub struct ServerState {
     pub allow_roots: Vec<PathBuf>,
     pub limits: ServerLimits,
     pub nvidia_smi_path: Option<PathBuf>,
+    pub npu_smi_path: Option<PathBuf>,
     processes: Arc<Mutex<BTreeMap<String, process::ManagedProcess>>>,
     modes: Arc<Mutex<ModeRegistry>>,
 }
@@ -130,6 +131,7 @@ impl ServerState {
                 .collect(),
             limits,
             nvidia_smi_path: None,
+            npu_smi_path: None,
             processes: Arc::new(Mutex::new(BTreeMap::new())),
             modes: Arc::new(Mutex::new(ModeRegistry::default())),
         }
@@ -179,10 +181,11 @@ pub async fn serve_with_config(
     limits: ServerLimits,
     tls: TlsConfig,
 ) -> Result<ExitCode> {
-    serve_with_config_and_nvidia_smi(listen, port, allow_roots, token, limits, tls, None).await
+    serve_with_config_and_accelerators(listen, port, allow_roots, token, limits, tls, None, None)
+        .await
 }
 
-pub async fn serve_with_config_and_nvidia_smi(
+pub async fn serve_with_config_and_accelerators(
     listen: String,
     port: u16,
     allow_roots: Vec<PathBuf>,
@@ -190,9 +193,11 @@ pub async fn serve_with_config_and_nvidia_smi(
     limits: ServerLimits,
     tls: TlsConfig,
     nvidia_smi_path: Option<PathBuf>,
+    npu_smi_path: Option<PathBuf>,
 ) -> Result<ExitCode> {
     let mut state = ServerState::with_limits(token, allow_roots, limits);
     state.nvidia_smi_path = nvidia_smi_path;
+    state.npu_smi_path = npu_smi_path;
     let state = Arc::new(state);
     process::spawn_maintenance_task(Arc::clone(&state));
 

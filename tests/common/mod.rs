@@ -770,13 +770,18 @@ pub fn wait_for_child_exit(child: &mut std::process::Child) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub fn write_mock_nvidia_smi(path: &Path, body: &str) -> Result<()> {
+pub fn write_mock_executable(path: &Path, body: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, body)?;
     let mut permissions = std::fs::metadata(path)?.permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(path, permissions)?;
     Ok(())
+}
+
+#[cfg(unix)]
+pub fn write_mock_nvidia_smi(path: &Path, body: &str) -> Result<()> {
+    write_mock_executable(path, body)
 }
 
 #[cfg(unix)]

@@ -534,7 +534,7 @@ SKILL/         Optional agent-facing operating instructions
 - process sessions are non-PTY
 - there is no terminal resize or terminal emulation
 - retry policy is conservative and only applies to safe client requests
-- NPU support is modeled as an accelerator kind, but no built-in NPU provider is implemented yet
+- NPU support includes a built-in Huawei Ascend provider through `npu-smi`
 - GPU support currently depends on `nvidia-smi`
 
 ## Agent Skill
