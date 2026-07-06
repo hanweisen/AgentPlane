@@ -7,17 +7,23 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::StatusCode;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use crate::cli_client::{post_json, print_error_response};
+use crate::cli_client::{
+    build_http_client, post_json, post_json_with_client, print_error_response,
+};
 use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
 use crate::protocol::{
     FileDeleteRequest, FileFindRequest, FileListRequest, FileReadRequest, FileReadResponse,
-    FileStatRequest, FileStatResponse, FileWriteRequest, SimpleResponse,
+    FileStatRequest, FileStatResponse, FileUploadChunkRequest, FileUploadChunkResponse,
+    FileUploadFinishRequest, FileUploadInitRequest, FileUploadInitResponse,
+    FileUploadStatusRequest, FileUploadStatusResponse, FileWriteRequest, SimpleResponse,
 };
 
 use super::{
-    FileDeleteArgs, FileFindArgs, FileListArgs, FileReadArgs, FileStatArgs, FileWaitArgs,
-    FileWriteArgs,
+    FileDeleteArgs, FileFindArgs, FileListArgs, FileReadArgs, FileStatArgs, FileUploadArgs,
+    FileWaitArgs, FileWriteArgs,
 };
 
 const FILE_WAIT_POLL_MS: u64 = 100;
@@ -154,6 +160,101 @@ pub(super) async fn file_write(args: FileWriteArgs, profile: &ClientProfile) -> 
     print_error_response(response).await
 }
 
+pub(super) async fn file_upload(args: FileUploadArgs, profile: &ClientProfile) -> Result<ExitCode> {
+    let auth = args.auth.resolve(profile)?;
+    let client = build_http_client(&auth)?;
+    let remote_root = resolve_remote_root(args.remote_root.as_ref(), profile)?;
+    if args.chunk_size == 0 {
+        bail!("--chunk-size must be greater than zero");
+    }
+
+    let local_metadata = std::fs::metadata(&args.from_local)
+        .with_context(|| format!("failed to stat {}", args.from_local.display()))?;
+    if !local_metadata.is_file() {
+        bail!("--from-local must point to a regular file");
+    }
+    let local_executable = is_local_executable(&args.from_local)?;
+    let local_mode = local_file_mode(&args.from_local)?;
+    let local_checksum = hash_local_file_sha256(&args.from_local)?;
+    if let Some(expected_checksum) = args.checksum_sha256.as_deref() {
+        let expected_checksum = normalize_sha256(expected_checksum);
+        validate_sha256(&expected_checksum)?;
+        if !local_checksum.eq_ignore_ascii_case(&expected_checksum) {
+            bail!(
+                "local file checksum mismatch for {}",
+                args.from_local.display()
+            );
+        }
+    }
+
+    let mode = args
+        .mode
+        .or_else(|| if args.preserve_mode { local_mode } else { None });
+    let init_payload = FileUploadInitRequest {
+        remote_root: remote_root.display().to_string(),
+        path: args.path,
+        total_size: local_metadata.len(),
+        chunk_size: u64::try_from(args.chunk_size).context("chunk size is too large")?,
+        executable: args.executable || local_executable,
+        create_parents: args.create_parents,
+        atomic: args.atomic,
+        mode,
+        preserve_mode: args.preserve_mode && mode.is_none(),
+        checksum_sha256: local_checksum.clone(),
+        resume: args.resume,
+    };
+    let init = init_upload(&client, &auth, &init_payload).await?;
+
+    let mut file = tokio::fs::File::open(&args.from_local)
+        .await
+        .with_context(|| format!("failed to open {}", args.from_local.display()))?;
+    file.seek(std::io::SeekFrom::Start(init.received_bytes))
+        .await?;
+
+    let mut offset = init.received_bytes;
+    let mut buffer = vec![0_u8; args.chunk_size];
+    while offset < init.total_size {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            bail!(
+                "local file ended early for {} at offset {}",
+                args.from_local.display(),
+                offset
+            );
+        }
+        let chunk = &buffer[..read];
+        let next_offset = offset
+            .checked_add(u64::try_from(read).context("chunk read overflow")?)
+            .ok_or_else(|| anyhow::anyhow!("upload offset overflow"))?;
+        let chunk_payload = FileUploadChunkRequest {
+            upload_id: init.upload_id.clone(),
+            offset,
+            data_b64: BASE64.encode(chunk),
+            chunk_checksum_sha256: Some(sha256_hex(chunk)),
+        };
+        let response =
+            upload_chunk_with_recovery(&client, &auth, &chunk_payload, next_offset).await?;
+        offset = response.received_bytes;
+    }
+
+    let response = post_json_with_client(
+        &client,
+        &auth,
+        "/v1/file/upload/finish",
+        &FileUploadFinishRequest {
+            upload_id: init.upload_id,
+        },
+        false,
+    )
+    .await?;
+    if response.status() == StatusCode::OK {
+        let body: SimpleResponse = response.json().await?;
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    print_error_response(response).await
+}
+
 pub(super) async fn file_delete(args: FileDeleteArgs, profile: &ClientProfile) -> Result<ExitCode> {
     let auth = args.auth.resolve(profile)?;
     let remote_root = resolve_remote_root(args.remote_root.as_ref(), profile)?;
@@ -215,6 +316,93 @@ async fn read_file_stat(
     }
 }
 
+async fn init_upload(
+    client: &reqwest::Client,
+    auth: &ResolvedClientAuth,
+    payload: &FileUploadInitRequest,
+) -> Result<FileUploadInitResponse> {
+    let response =
+        post_json_with_client(client, auth, "/v1/file/upload/init", payload, false).await?;
+    if response.status() == StatusCode::OK {
+        return Ok(response.json().await?);
+    }
+    Err(anyhow::anyhow!(response.text().await?))
+}
+
+async fn upload_chunk_with_recovery(
+    client: &reqwest::Client,
+    auth: &ResolvedClientAuth,
+    payload: &FileUploadChunkRequest,
+    expected_next_offset: u64,
+) -> Result<FileUploadChunkResponse> {
+    let max_attempts = auth.connect_retries.saturating_add(1);
+    let mut last_error = None;
+    for attempt in 0..max_attempts {
+        match post_json_with_client(client, auth, "/v1/file/upload/chunk", payload, false).await {
+            Ok(response) => {
+                if response.status() == StatusCode::OK {
+                    let body: FileUploadChunkResponse = response.json().await?;
+                    if body.received_bytes != expected_next_offset {
+                        bail!(
+                            "upload chunk advanced to unexpected offset {}",
+                            body.received_bytes
+                        );
+                    }
+                    return Ok(body);
+                }
+                last_error = Some(anyhow::anyhow!(response.text().await?));
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+
+        let status = read_upload_status(
+            client,
+            auth,
+            &FileUploadStatusRequest {
+                upload_id: payload.upload_id.clone(),
+            },
+        )
+        .await;
+        if let Ok(status) = status {
+            if status.received_bytes == expected_next_offset {
+                return Ok(FileUploadChunkResponse {
+                    ok: true,
+                    upload_id: status.upload_id,
+                    received_bytes: status.received_bytes,
+                });
+            }
+            if status.received_bytes > payload.offset
+                && status.received_bytes < expected_next_offset
+            {
+                bail!(
+                    "upload resumed at unexpected intermediate offset {}",
+                    status.received_bytes
+                );
+            }
+        }
+
+        if attempt + 1 < max_attempts {
+            tokio::time::sleep(Duration::from_millis(auth.connect_retry_delay_ms)).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("upload chunk failed")))
+}
+
+async fn read_upload_status(
+    client: &reqwest::Client,
+    auth: &ResolvedClientAuth,
+    payload: &FileUploadStatusRequest,
+) -> Result<FileUploadStatusResponse> {
+    let response =
+        post_json_with_client(client, auth, "/v1/file/upload/status", payload, true).await?;
+    if response.status() == StatusCode::OK {
+        return Ok(response.json().await?);
+    }
+    Err(anyhow::anyhow!(response.text().await?))
+}
+
 fn stat_ready(stat: &FileStatResponse, min_bytes: Option<u64>) -> bool {
     if !stat.exists {
         return false;
@@ -223,6 +411,45 @@ fn stat_ready(stat: &FileStatResponse, min_bytes: Option<u64>) -> bool {
         return stat.size.is_some_and(|size| size >= min_bytes);
     }
     true
+}
+
+fn hash_local_file_sha256(path: &Path) -> Result<String> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn validate_sha256(value: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("checksum must be a sha256 hex digest or sha256:<hex>");
+    }
+    Ok(())
+}
+
+fn normalize_sha256(value: &str) -> String {
+    value.strip_prefix("sha256:").unwrap_or(value).to_string()
+}
+
+fn sha256_hex(content: &[u8]) -> String {
+    hex_digest(Sha256::digest(content).as_slice())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
 }
 
 fn is_local_executable(path: &Path) -> Result<bool> {

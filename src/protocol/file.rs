@@ -66,6 +66,75 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileUploadInitRequest {
+    pub remote_root: String,
+    pub path: String,
+    pub total_size: u64,
+    pub chunk_size: u64,
+    pub executable: bool,
+    #[serde(default = "default_true")]
+    pub create_parents: bool,
+    #[serde(default)]
+    pub atomic: bool,
+    #[serde(default)]
+    pub mode: Option<u32>,
+    #[serde(default)]
+    pub preserve_mode: bool,
+    pub checksum_sha256: String,
+    #[serde(default)]
+    pub resume: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileUploadInitResponse {
+    pub ok: bool,
+    pub upload_id: String,
+    pub received_bytes: u64,
+    pub total_size: u64,
+    pub chunk_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileUploadChunkRequest {
+    pub upload_id: String,
+    pub offset: u64,
+    pub data_b64: String,
+    #[serde(default)]
+    pub chunk_checksum_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileUploadChunkResponse {
+    pub ok: bool,
+    pub upload_id: String,
+    pub received_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileUploadStatusRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileUploadStatusResponse {
+    pub ok: bool,
+    pub upload_id: String,
+    pub received_bytes: u64,
+    pub total_size: u64,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileUploadFinishRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileUploadAbortRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileDeleteRequest {
     pub remote_root: String,
     pub path: String,

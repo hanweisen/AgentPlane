@@ -13,7 +13,9 @@ pub use common::SimpleResponse;
 pub use file::{
     FileDeleteRequest, FileFindRequest, FileFindResponse, FileListEntry, FileListRequest,
     FileListResponse, FileReadRequest, FileReadResponse, FileStatRequest, FileStatResponse,
-    FileWrite, FileWriteRequest,
+    FileUploadAbortRequest, FileUploadChunkRequest, FileUploadChunkResponse,
+    FileUploadFinishRequest, FileUploadInitRequest, FileUploadInitResponse,
+    FileUploadStatusRequest, FileUploadStatusResponse, FileWrite, FileWriteRequest,
 };
 pub use mode::{
     AgentLease, AgentMode, HEADER_AGENT_MODE, HEADER_LEASE_ID, HEADER_TASK_ID, LeaseReleaseRequest,

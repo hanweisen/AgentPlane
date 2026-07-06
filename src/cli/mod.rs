@@ -54,6 +54,7 @@ enum CommandKind {
     FileStat(FileStatArgs),
     FileWait(FileWaitArgs),
     FileWrite(FileWriteArgs),
+    FileUpload(FileUploadArgs),
     FileDelete(FileDeleteArgs),
     FileFind(FileFindArgs),
     FileList(FileListArgs),
@@ -586,6 +587,34 @@ struct FileWriteArgs {
 }
 
 #[derive(Debug, Args)]
+struct FileUploadArgs {
+    #[command(flatten)]
+    auth: ClientAuthArgs,
+    #[arg(long = "remote-root")]
+    remote_root: Option<PathBuf>,
+    #[arg(long = "path")]
+    path: String,
+    #[arg(long = "from-local", value_name = "PATH")]
+    from_local: PathBuf,
+    #[arg(long = "chunk-size", value_name = "BYTES", default_value_t = 4 * 1024 * 1024)]
+    chunk_size: usize,
+    #[arg(long = "resume", default_value_t = false)]
+    resume: bool,
+    #[arg(long = "executable", default_value_t = false)]
+    executable: bool,
+    #[arg(long = "create-parents", default_value_t = true)]
+    create_parents: bool,
+    #[arg(long = "atomic", default_value_t = false)]
+    atomic: bool,
+    #[arg(long = "mode", value_parser = parse_octal_mode)]
+    mode: Option<u32>,
+    #[arg(long = "preserve-mode", default_value_t = false)]
+    preserve_mode: bool,
+    #[arg(long = "checksum", value_name = "SHA256")]
+    checksum_sha256: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct FileDeleteArgs {
     #[command(flatten)]
     auth: ClientAuthArgs,
@@ -670,6 +699,7 @@ pub async fn run() -> Result<ExitCode> {
         CommandKind::FileStat(args) => file::file_stat(args, &profile).await,
         CommandKind::FileWait(args) => file::file_wait(args, &profile).await,
         CommandKind::FileWrite(args) => file::file_write(args, &profile).await,
+        CommandKind::FileUpload(args) => file::file_upload(args, &profile).await,
         CommandKind::FileDelete(args) => file::file_delete(args, &profile).await,
         CommandKind::FileFind(args) => file::file_find(args, &profile).await,
         CommandKind::FileList(args) => file::file_list(args, &profile).await,

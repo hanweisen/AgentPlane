@@ -234,6 +234,67 @@ fn cli_shared_mode_requires_active_lease_for_process_start() -> Result<()> {
 }
 
 #[test]
+fn cli_file_upload_still_works_when_server_is_in_shared_mode() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let harness = CliServerHarness::start(remote_root.path(), "test-token")?;
+    let remote_root_str = remote_root.path().display().to_string();
+
+    let switched = run_cli(&[
+        "mode-switch",
+        "--server",
+        &harness.base_url,
+        "--token",
+        "test-token",
+        "--mode",
+        "shared",
+        "--task-id",
+        "task-file",
+        "--lease-id",
+        "lease-file",
+        "--ttl-seconds",
+        "60",
+    ])?;
+    assert!(switched.status.success());
+
+    let local_upload = remote_root.path().join("shared-upload.bin");
+    std::fs::write(&local_upload, b"shared-mode-upload")?;
+
+    let uploaded = run_cli(&[
+        "file-upload",
+        "--server",
+        &harness.base_url,
+        "--token",
+        "test-token",
+        "--remote-root",
+        &remote_root_str,
+        "--path",
+        "shared/upload.bin",
+        "--from-local",
+        &local_upload.display().to_string(),
+        "--chunk-size",
+        "4",
+        "--resume",
+    ])?;
+    assert!(uploaded.status.success());
+
+    let read = run_cli(&[
+        "file-read",
+        "--server",
+        &harness.base_url,
+        "--token",
+        "test-token",
+        "--remote-root",
+        &remote_root_str,
+        "--path",
+        "shared/upload.bin",
+        "--text",
+    ])?;
+    assert!(read.status.success());
+    assert_eq!(String::from_utf8(read.stdout)?, "shared-mode-upload");
+    Ok(())
+}
+
+#[test]
 fn cli_multi_agent_shared_mode_keeps_active_agent_resources_isolated() -> Result<()> {
     let remote_root = tempfile::tempdir()?;
     let harness = CliServerHarness::start(remote_root.path(), "test-token")?;

@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
@@ -15,11 +15,30 @@ use super::ServerState;
 use crate::protocol::{
     CommandResult, FileDeleteRequest, FileFindRequest, FileFindResponse, FileListEntry,
     FileListRequest, FileListResponse, FileReadRequest, FileReadResponse, FileStatRequest,
-    FileStatResponse, FileWrite, FileWriteRequest, SimpleResponse, SyncMode, SyncPayload,
+    FileStatResponse, FileUploadChunkRequest, FileUploadChunkResponse, FileUploadFinishRequest,
+    FileUploadInitRequest, FileUploadInitResponse, FileUploadStatusRequest,
+    FileUploadStatusResponse, FileWrite, FileWriteRequest, SimpleResponse, SyncMode, SyncPayload,
     SyncReport, SyncResponse, relative_path_matches_preserve_path,
 };
 
 const DEFAULT_SYNC_RUN_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct UploadSession {
+    pub upload_id: String,
+    remote_root: String,
+    path: String,
+    target_path: PathBuf,
+    staging_path: PathBuf,
+    total_size: u64,
+    chunk_size: u64,
+    checksum_sha256: String,
+    create_parents: bool,
+    atomic: bool,
+    mode: Option<u32>,
+    executable: bool,
+    preserve_mode: bool,
+}
 
 pub async fn handle_sync_run(state: &ServerState, payload: SyncPayload) -> Result<SyncResponse> {
     let remote_root = resolve_remote_root(&state.allow_roots, &payload.remote_root)?;
@@ -149,6 +168,312 @@ pub async fn handle_file_write(
         ok: true,
         error: None,
     })
+}
+
+pub async fn handle_file_upload_init(
+    state: &ServerState,
+    payload: FileUploadInitRequest,
+) -> Result<FileUploadInitResponse> {
+    let checksum_sha256 = normalize_sha256(&payload.checksum_sha256);
+    validate_sha256(&checksum_sha256)?;
+    if payload.chunk_size == 0 {
+        bail!("chunk_size must be greater than zero");
+    }
+    let remote_root = resolve_remote_root(&state.allow_roots, &payload.remote_root)?;
+    let target_path = safe_join(&remote_root, &payload.path)?;
+    let staging_path = upload_staging_path(&target_path, &checksum_sha256, payload.atomic)?;
+
+    if payload.create_parents
+        && let Some(parent) = staging_path.parent()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut uploads = state.uploads.lock().await;
+    let mut existing_upload_id = None;
+    for (upload_id, session) in uploads.iter() {
+        if session.remote_root == payload.remote_root
+            && session.path == payload.path
+            && session
+                .checksum_sha256
+                .eq_ignore_ascii_case(&checksum_sha256)
+        {
+            existing_upload_id = Some(upload_id.clone());
+            break;
+        }
+    }
+
+    let session = if let Some(upload_id) = existing_upload_id {
+        let session = uploads
+            .get_mut(&upload_id)
+            .ok_or_else(|| anyhow!("upload session disappeared during init"))?;
+        ensure_matching_upload_init(session, &payload, &checksum_sha256)?;
+        session.clone()
+    } else {
+        let upload_id = Uuid::new_v4().to_string();
+        let session = UploadSession {
+            upload_id: upload_id.clone(),
+            remote_root: payload.remote_root.clone(),
+            path: payload.path.clone(),
+            target_path,
+            staging_path,
+            total_size: payload.total_size,
+            chunk_size: payload.chunk_size,
+            checksum_sha256: checksum_sha256.clone(),
+            create_parents: payload.create_parents,
+            atomic: payload.atomic,
+            mode: payload.mode,
+            executable: payload.executable,
+            preserve_mode: payload.preserve_mode,
+        };
+        uploads.insert(upload_id, session.clone());
+        session
+    };
+    drop(uploads);
+
+    let received_bytes = if payload.resume {
+        upload_current_size(&session).await?
+    } else {
+        reset_upload_contents(&session).await?;
+        0
+    };
+    if received_bytes > session.total_size {
+        bail!(
+            "partial upload for {} exceeds declared size",
+            session.target_path.display()
+        );
+    }
+
+    Ok(FileUploadInitResponse {
+        ok: true,
+        upload_id: session.upload_id,
+        received_bytes,
+        total_size: session.total_size,
+        chunk_size: session.chunk_size,
+    })
+}
+
+pub async fn handle_file_upload_chunk(
+    state: &ServerState,
+    payload: FileUploadChunkRequest,
+) -> Result<FileUploadChunkResponse> {
+    let session = get_upload_session(state, &payload.upload_id).await?;
+    let data = BASE64
+        .decode(payload.data_b64.as_bytes())
+        .context("failed to decode base64 upload chunk")?;
+    if let Some(chunk_checksum_sha256) = payload.chunk_checksum_sha256.as_deref() {
+        let chunk_checksum_sha256 = normalize_sha256(chunk_checksum_sha256);
+        validate_sha256(&chunk_checksum_sha256)?;
+        let actual = sha256_hex(&data);
+        if !actual.eq_ignore_ascii_case(&chunk_checksum_sha256) {
+            bail!("upload chunk checksum mismatch for {}", session.path);
+        }
+    }
+    let current_size = upload_current_size(&session).await?;
+    if current_size != payload.offset {
+        bail!(
+            "upload offset mismatch for {}: expected {}, got {}",
+            session.path,
+            current_size,
+            payload.offset
+        );
+    }
+    let next_size = current_size
+        .checked_add(u64::try_from(data.len()).context("upload chunk too large")?)
+        .ok_or_else(|| anyhow!("upload size overflow for {}", session.path))?;
+    if next_size > session.total_size {
+        bail!(
+            "upload chunk exceeds declared size for {}",
+            session.target_path.display()
+        );
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&session.staging_path)
+        .await
+        .with_context(|| format!("failed to open {}", session.staging_path.display()))?;
+    file.write_all(&data)
+        .await
+        .with_context(|| format!("failed to append {}", session.staging_path.display()))?;
+    file.flush().await?;
+
+    Ok(FileUploadChunkResponse {
+        ok: true,
+        upload_id: session.upload_id,
+        received_bytes: next_size,
+    })
+}
+
+pub async fn handle_file_upload_status(
+    state: &ServerState,
+    payload: FileUploadStatusRequest,
+) -> Result<FileUploadStatusResponse> {
+    let session = get_upload_session(state, &payload.upload_id).await?;
+    let received_bytes = upload_current_size(&session).await?;
+    Ok(FileUploadStatusResponse {
+        ok: true,
+        upload_id: session.upload_id,
+        received_bytes,
+        total_size: session.total_size,
+        path: session.path,
+    })
+}
+
+pub async fn handle_file_upload_finish(
+    state: &ServerState,
+    payload: FileUploadFinishRequest,
+) -> Result<SimpleResponse> {
+    let session = get_upload_session(state, &payload.upload_id).await?;
+    let received_bytes = upload_current_size(&session).await?;
+    if received_bytes != session.total_size {
+        bail!(
+            "upload for {} is incomplete: have {}, need {}",
+            session.path,
+            received_bytes,
+            session.total_size
+        );
+    }
+
+    let actual_sha256 = hash_file_sha256(&session.staging_path).await?;
+    if !actual_sha256.eq_ignore_ascii_case(&session.checksum_sha256) {
+        bail!("final checksum mismatch for {}", session.path);
+    }
+
+    let existing_mode = metadata_mode(&session.target_path).await?;
+    if session.atomic {
+        if let Some(parent) = session.target_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::rename(&session.staging_path, &session.target_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to publish {} to {}",
+                    session.staging_path.display(),
+                    session.target_path.display()
+                )
+            })?;
+    }
+
+    let mode = resolve_write_mode(
+        &WriteFileOptions {
+            create_parents: session.create_parents,
+            atomic: session.atomic,
+            mode: session.mode,
+            executable: session.executable,
+            preserve_mode: session.preserve_mode,
+            expected_sha256: None,
+            skip_if_same: false,
+        },
+        existing_mode,
+    );
+    apply_write_mode(&session.target_path, mode, session.executable).await?;
+
+    let mut uploads = state.uploads.lock().await;
+    uploads.remove(&payload.upload_id);
+    drop(uploads);
+
+    Ok(SimpleResponse {
+        ok: true,
+        error: None,
+    })
+}
+
+pub async fn handle_file_upload_abort(
+    state: &ServerState,
+    payload: crate::protocol::FileUploadAbortRequest,
+) -> Result<SimpleResponse> {
+    let mut uploads = state.uploads.lock().await;
+    let Some(session) = uploads.remove(&payload.upload_id) else {
+        bail!("upload not found: {}", payload.upload_id);
+    };
+    drop(uploads);
+
+    match tokio::fs::remove_file(&session.staging_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(SimpleResponse {
+        ok: true,
+        error: None,
+    })
+}
+
+fn ensure_matching_upload_init(
+    session: &UploadSession,
+    payload: &FileUploadInitRequest,
+    checksum_sha256: &str,
+) -> Result<()> {
+    if session.total_size != payload.total_size
+        || session.chunk_size != payload.chunk_size
+        || session.atomic != payload.atomic
+        || session.mode != payload.mode
+        || session.executable != payload.executable
+        || session.preserve_mode != payload.preserve_mode
+        || session.create_parents != payload.create_parents
+        || !session
+            .checksum_sha256
+            .eq_ignore_ascii_case(checksum_sha256)
+    {
+        bail!(
+            "resume parameters do not match existing upload for {}",
+            session.path
+        );
+    }
+    Ok(())
+}
+
+async fn get_upload_session(state: &ServerState, upload_id: &str) -> Result<UploadSession> {
+    let uploads = state.uploads.lock().await;
+    uploads
+        .get(upload_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("upload not found: {upload_id}"))
+}
+
+fn upload_staging_path(target_path: &Path, checksum_sha256: &str, atomic: bool) -> Result<PathBuf> {
+    if !atomic {
+        return Ok(target_path.to_path_buf());
+    }
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| anyhow!("target path has no parent: {}", target_path.display()))?;
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "target path has invalid file name: {}",
+                target_path.display()
+            )
+        })?;
+    Ok(parent.join(format!(
+        ".{file_name}.{}.upload.part",
+        &checksum_sha256[..12]
+    )))
+}
+
+async fn upload_current_size(session: &UploadSession) -> Result<u64> {
+    match tokio::fs::metadata(&session.staging_path).await {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn reset_upload_contents(session: &UploadSession) -> Result<()> {
+    if session.create_parents
+        && let Some(parent) = session.staging_path.parent()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&session.staging_path, [])
+        .await
+        .with_context(|| format!("failed to reset {}", session.staging_path.display()))
 }
 
 pub async fn handle_file_delete(

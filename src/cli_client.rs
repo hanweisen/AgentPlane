@@ -21,16 +21,29 @@ pub(crate) async fn post_json<T: serde::Serialize>(
     payload: &T,
     retry_safe: bool,
 ) -> Result<reqwest::Response> {
+    let client = build_http_client(auth)?;
+    post_json_with_client(&client, auth, path, payload, retry_safe).await
+}
+
+pub(crate) async fn post_json_with_client<T: serde::Serialize>(
+    client: &Client,
+    auth: &ResolvedClientAuth,
+    path: &str,
+    payload: &T,
+    retry_safe: bool,
+) -> Result<reqwest::Response> {
+    let client = client.clone();
+    let url = format!("{}{}", normalize_server_url(&auth.server), path);
+    let authorization = format!("Bearer {}", auth.token);
     send_with_retry(
         &auth.server,
         auth.connect_retries,
         auth.connect_retry_delay_ms,
         retry_safe,
         || {
-            let client = build_http_client(auth)?;
             Ok(client
-                .post(format!("{}{}", normalize_server_url(&auth.server), path))
-                .header(AUTHORIZATION, format!("Bearer {}", auth.token))
+                .post(&url)
+                .header(AUTHORIZATION, authorization.clone())
                 .json(payload))
         },
     )

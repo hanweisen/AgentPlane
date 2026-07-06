@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use agentplane::protocol::{
     FileDeleteRequest, FileFindRequest, FileListRequest, FileReadRequest, FileStatRequest,
-    FileWriteRequest,
+    FileUploadChunkRequest, FileUploadFinishRequest, FileUploadInitRequest,
+    FileUploadStatusRequest, FileWriteRequest,
 };
 use agentplane::server::{
     ServerState, handle_file_delete, handle_file_find, handle_file_list, handle_file_read,
-    handle_file_stat, handle_file_write,
+    handle_file_stat, handle_file_upload_chunk, handle_file_upload_finish, handle_file_upload_init,
+    handle_file_upload_status, handle_file_write,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -132,6 +134,123 @@ async fn file_operations_round_trip_cover_write_read_list_find_delete_and_guards
         .await
         .is_err()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_upload_resume_round_trip_preserves_content_and_mode() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+    let content = b"chunk-one\nchunk-two\n";
+    let checksum = test_sha256_hex(content);
+
+    let init = handle_file_upload_init(
+        &state,
+        FileUploadInitRequest {
+            remote_root: remote_root.path().display().to_string(),
+            path: "nested/upload.txt".to_string(),
+            total_size: u64::try_from(content.len())?,
+            chunk_size: 5,
+            executable: true,
+            create_parents: true,
+            atomic: true,
+            mode: Some(0o700),
+            preserve_mode: false,
+            checksum_sha256: checksum.clone(),
+            resume: false,
+        },
+    )
+    .await?;
+    assert_eq!(init.received_bytes, 0);
+
+    let first = &content[..5];
+    let first_chunk = handle_file_upload_chunk(
+        &state,
+        FileUploadChunkRequest {
+            upload_id: init.upload_id.clone(),
+            offset: 0,
+            data_b64: BASE64.encode(first),
+            chunk_checksum_sha256: Some(test_sha256_hex(first)),
+        },
+    )
+    .await?;
+    assert_eq!(first_chunk.received_bytes, 5);
+
+    let resumed = handle_file_upload_init(
+        &state,
+        FileUploadInitRequest {
+            remote_root: remote_root.path().display().to_string(),
+            path: "nested/upload.txt".to_string(),
+            total_size: u64::try_from(content.len())?,
+            chunk_size: 5,
+            executable: true,
+            create_parents: true,
+            atomic: true,
+            mode: Some(0o700),
+            preserve_mode: false,
+            checksum_sha256: checksum.clone(),
+            resume: true,
+        },
+    )
+    .await?;
+    assert_eq!(resumed.received_bytes, 5);
+    assert_eq!(resumed.upload_id, init.upload_id);
+
+    let status = handle_file_upload_status(
+        &state,
+        FileUploadStatusRequest {
+            upload_id: init.upload_id.clone(),
+        },
+    )
+    .await?;
+    assert_eq!(status.received_bytes, 5);
+
+    let second = &content[5..];
+    handle_file_upload_chunk(
+        &state,
+        FileUploadChunkRequest {
+            upload_id: init.upload_id.clone(),
+            offset: 5,
+            data_b64: BASE64.encode(second),
+            chunk_checksum_sha256: Some(test_sha256_hex(second)),
+        },
+    )
+    .await?;
+    handle_file_upload_finish(
+        &state,
+        FileUploadFinishRequest {
+            upload_id: init.upload_id,
+        },
+    )
+    .await?;
+
+    let read = handle_file_read(
+        &state,
+        FileReadRequest {
+            remote_root: remote_root.path().display().to_string(),
+            path: "nested/upload.txt".to_string(),
+        },
+    )
+    .await?;
+    assert_eq!(
+        decode_b64(&read.content_b64)?,
+        String::from_utf8_lossy(content)
+    );
+    assert!(read.executable);
+
+    let stat = handle_file_stat(
+        &state,
+        FileStatRequest {
+            remote_root: remote_root.path().display().to_string(),
+            path: "nested/upload.txt".to_string(),
+        },
+    )
+    .await?;
+    assert_eq!(stat.sha256.as_deref(), Some(checksum.as_str()));
+    assert!(stat.executable);
     Ok(())
 }
 
@@ -656,6 +775,76 @@ fn cli_process_and_file_round_trip() -> Result<()> {
     ])?;
     assert!(file_delete.status.success());
     assert!(!remote_root.path().join("nested/input.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn cli_file_upload_transfers_large_local_file_in_chunks() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    let local_upload = remote_root.path().join("large-local-upload.bin");
+    let content = b"0123456789abcdef0123456789abcdef";
+    std::fs::write(&local_upload, content)?;
+    let checksum = test_sha256_hex(content);
+
+    let file_upload = run_cli(&[
+        "file-upload",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--path",
+        "nested/chunked.bin",
+        "--from-local",
+        &local_upload.display().to_string(),
+        "--chunk-size",
+        "7",
+        "--atomic",
+        "--mode",
+        "700",
+        "--checksum",
+        &format!("sha256:{checksum}"),
+        "--resume",
+    ])?;
+    assert!(file_upload.status.success());
+
+    let file_read = run_cli(&[
+        "file-read",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--path",
+        "nested/chunked.bin",
+    ])?;
+    assert!(file_read.status.success());
+    let file_read_body: serde_json::Value = serde_json::from_slice(&file_read.stdout)?;
+    assert_eq!(
+        decode_b64(file_read_body["content_b64"].as_str().unwrap_or_default())?,
+        String::from_utf8_lossy(content)
+    );
+
+    let file_stat = run_cli(&[
+        "file-stat",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--path",
+        "nested/chunked.bin",
+    ])?;
+    assert!(file_stat.status.success());
+    let file_stat_body: serde_json::Value = serde_json::from_slice(&file_stat.stdout)?;
+    assert_eq!(file_stat_body["sha256"], checksum);
+    assert!(file_stat_body["executable"].as_bool().unwrap_or(false));
     Ok(())
 }
 

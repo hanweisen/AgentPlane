@@ -24,7 +24,8 @@ mod util;
 pub use self::accelerator::handle_accelerator_status;
 pub use self::file::{
     handle_file_delete, handle_file_find, handle_file_list, handle_file_read, handle_file_stat,
-    handle_file_write, handle_sync_run,
+    handle_file_upload_abort, handle_file_upload_chunk, handle_file_upload_finish,
+    handle_file_upload_init, handle_file_upload_status, handle_file_write, handle_sync_run,
 };
 pub use self::process::{
     handle_process_cleanup, handle_process_get, handle_process_list, handle_process_read,
@@ -36,10 +37,12 @@ use self::error::{bad_request_response, unauthorized_response};
 use crate::mode::ModeRegistry;
 use crate::protocol::{
     AcceleratorStatusRequest, FileDeleteRequest, FileFindRequest, FileListRequest, FileReadRequest,
-    FileStatRequest, FileWriteRequest, LeaseReleaseRequest, LeaseReleaseResponse,
-    LeaseRenewRequest, LeaseRenewResponse, ModeGetRequest, ModeGetResponse, ModeSwitchRequest,
-    ModeSwitchResponse, ProcessCleanupRequest, ProcessGetRequest, ProcessReadRequest,
-    ProcessStartRequest, ProcessTerminateRequest, ProcessWriteRequest, SimpleResponse, SyncPayload,
+    FileStatRequest, FileUploadAbortRequest, FileUploadChunkRequest, FileUploadFinishRequest,
+    FileUploadInitRequest, FileUploadStatusRequest, FileWriteRequest, LeaseReleaseRequest,
+    LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, ModeGetRequest, ModeGetResponse,
+    ModeSwitchRequest, ModeSwitchResponse, ProcessCleanupRequest, ProcessGetRequest,
+    ProcessReadRequest, ProcessStartRequest, ProcessTerminateRequest, ProcessWriteRequest,
+    SimpleResponse, SyncPayload,
 };
 
 const DEFAULT_PROCESS_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
@@ -115,6 +118,7 @@ pub struct ServerState {
     pub npu_smi_path: Option<PathBuf>,
     processes: Arc<Mutex<BTreeMap<String, process::ManagedProcess>>>,
     modes: Arc<Mutex<ModeRegistry>>,
+    uploads: Arc<Mutex<BTreeMap<String, file::UploadSession>>>,
 }
 
 impl ServerState {
@@ -134,6 +138,7 @@ impl ServerState {
             npu_smi_path: None,
             processes: Arc::new(Mutex::new(BTreeMap::new())),
             modes: Arc::new(Mutex::new(ModeRegistry::default())),
+            uploads: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -219,6 +224,11 @@ pub async fn serve_with_config_and_accelerators(
         .route("/v1/file/read", post(file_read))
         .route("/v1/file/stat", post(file_stat))
         .route("/v1/file/write", post(file_write))
+        .route("/v1/file/upload/init", post(file_upload_init))
+        .route("/v1/file/upload/chunk", post(file_upload_chunk))
+        .route("/v1/file/upload/status", post(file_upload_status))
+        .route("/v1/file/upload/finish", post(file_upload_finish))
+        .route("/v1/file/upload/abort", post(file_upload_abort))
         .route("/v1/file/delete", post(file_delete))
         .route("/v1/file/find", post(file_find))
         .route("/v1/file/list", post(file_list))
@@ -516,6 +526,76 @@ async fn file_write(
         return unauthorized_response().into_response();
     }
     match file::handle_file_write(&state, payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn file_upload_init(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<FileUploadInitRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    match file::handle_file_upload_init(&state, payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn file_upload_chunk(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<FileUploadChunkRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    match file::handle_file_upload_chunk(&state, payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn file_upload_status(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<FileUploadStatusRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    match file::handle_file_upload_status(&state, payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn file_upload_finish(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<FileUploadFinishRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    match file::handle_file_upload_finish(&state, payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn file_upload_abort(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<FileUploadAbortRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    match file::handle_file_upload_abort(&state, payload).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => bad_request_response(error).into_response(),
     }

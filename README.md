@@ -372,6 +372,21 @@ Upload local bytes atomically with a mode and checksum:
   --checksum sha256:<hex>
 ```
 
+Upload a large local file in chunks with resume support:
+
+```bash
+./agentplane file-upload \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --remote-root "$AP_REMOTE_ROOT" \
+  --path models/weights.bin \
+  --from-local ./models/weights.bin \
+  --chunk-size 4194304 \
+  --atomic \
+  --checksum sha256:<hex> \
+  --resume
+```
+
 Wait for generated output:
 
 ```bash
@@ -480,7 +495,7 @@ Renew or release the lease at task boundaries:
 | Connectivity | `health` |
 | Sync | `sync-run` |
 | Processes | `process-start`, `process-run`, `process-get`, `process-list`, `process-read`, `process-write`, `process-terminate`, `process-cleanup` |
-| Files | `file-read`, `file-stat`, `file-wait`, `file-write`, `file-delete`, `file-find`, `file-list` |
+| Files | `file-read`, `file-stat`, `file-wait`, `file-write`, `file-upload`, `file-delete`, `file-find`, `file-list` |
 | Accelerators | `accelerator-status`, `accelerator-preflight`, `accelerator-wait-idle`, `gpu-status`, `gpu-preflight`, `gpu-wait-idle` |
 | Shared mode | `mode-get`, `mode-switch`, `lease-renew`, `lease-release` |
 | Server | `server` |

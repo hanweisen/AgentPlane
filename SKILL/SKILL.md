@@ -388,6 +388,22 @@ supplied; with inline `--content`, it preserves the existing remote target mode.
 directory creation remains enabled by default and can be made explicit with
 `--create-parents`.
 
+For large local artifacts or gateway-constrained uploads, prefer `file-upload` so each
+request stays bounded and interrupted transfers can resume:
+
+```bash
+"$AP_BIN" file-upload \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --remote-root "$AP_REMOTE_ROOT" \
+  --path models/weights.bin \
+  --from-local ./models/weights.bin \
+  --chunk-size 4194304 \
+  --atomic \
+  --checksum sha256:<hex> \
+  --resume
+```
+
 ### Accelerator status
 
 `agentplane` treats accelerator inspection as a generic module. Use
@@ -807,6 +823,7 @@ Operate defensively:
 
 - keep each single request and response comfortably below 10 MB
 - do not send large inline file payloads through one `file-write`
+- prefer `file-upload --chunk-size <BYTES> --resume` for large local files
 - do not ask for huge log reads in one `process-read`
 - do not assume gzip will save an oversized response enough to be safe
 
