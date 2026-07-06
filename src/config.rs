@@ -26,6 +26,12 @@ pub(crate) struct ClientAuthArgs {
     server: Option<String>,
     #[arg(long)]
     token: Option<String>,
+    #[arg(
+        long = "socks5-hostname",
+        value_name = "HOST:PORT|URL",
+        help = "Route requests through a SOCKS5 proxy with remote DNS, for example 127.0.0.1:1086 or socks5h://127.0.0.1:1086."
+    )]
+    socks5_hostname: Option<String>,
     #[arg(long = "request-timeout-seconds")]
     request_timeout_seconds: Option<u64>,
     #[arg(long = "connect-retries")]
@@ -51,6 +57,7 @@ pub(crate) struct ClientProfile {
     pub(crate) server: Option<String>,
     token: Option<String>,
     remote_root: Option<PathBuf>,
+    pub(crate) socks5_hostname: Option<String>,
     pub(crate) headers: Vec<String>,
     pub(crate) connect_retries: Option<usize>,
     pub(crate) connect_retry_delay_ms: Option<u64>,
@@ -60,6 +67,7 @@ pub(crate) struct ClientProfile {
 pub(crate) struct ResolvedClientAuth {
     pub(crate) server: String,
     pub(crate) token: String,
+    pub(crate) socks5_hostname: Option<String>,
     pub(crate) request_timeout_seconds: u64,
     pub(crate) connect_retries: usize,
     pub(crate) connect_retry_delay_ms: u64,
@@ -85,6 +93,10 @@ impl ClientAuthArgs {
         Ok(ResolvedClientAuth {
             server,
             token,
+            socks5_hostname: self
+                .socks5_hostname
+                .clone()
+                .or_else(|| profile.socks5_hostname.clone()),
             request_timeout_seconds: self
                 .request_timeout_seconds
                 .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECONDS),
@@ -115,6 +127,7 @@ pub(crate) fn load_client_profile(path: Option<&PathBuf>) -> Result<ClientProfil
         server: values.get("AP_SERVER").cloned(),
         token: values.get("AP_TOKEN").cloned(),
         remote_root: values.get("AP_REMOTE_ROOT").map(PathBuf::from),
+        socks5_hostname: values.get("AP_SOCKS5_HOSTNAME").cloned(),
         ..ClientProfile::default()
     };
     profile.headers.extend(profile_headers(&values));
@@ -205,4 +218,24 @@ pub(crate) fn parse_octal_mode(value: &str) -> std::result::Result<u32, String> 
                 Err("mode must be no greater than 7777".to_string())
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_client_profile_reads_socks5_hostname() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("agentplane.env");
+        std::fs::write(
+            &path,
+            "AP_SERVER=http://example.test\nAP_TOKEN=test-token\nAP_SOCKS5_HOSTNAME=127.0.0.1:1086\n",
+        )?;
+
+        let profile = load_client_profile(Some(&path))?;
+        assert_eq!(profile.server.as_deref(), Some("http://example.test"));
+        assert_eq!(profile.socks5_hostname.as_deref(), Some("127.0.0.1:1086"));
+        Ok(())
+    }
 }

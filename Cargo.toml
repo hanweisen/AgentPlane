@@ -19,10 +19,10 @@ tokio = { version = "1.48", features = ["fs", "macros", "process", "rt-multi-thr
 uuid = { version = "1.18", features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "native-tls", "socks"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls", "socks"] }
 
 [dev-dependencies]
 flate2 = "1.1"

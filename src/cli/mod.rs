@@ -106,6 +106,12 @@ struct SyncRunArgs {
 struct HealthArgs {
     #[arg(long)]
     server: Option<String>,
+    #[arg(
+        long = "socks5-hostname",
+        value_name = "HOST:PORT|URL",
+        help = "Route requests through a SOCKS5 proxy with remote DNS, for example 127.0.0.1:1086 or socks5h://127.0.0.1:1086."
+    )]
+    socks5_hostname: Option<String>,
     #[arg(long = "request-timeout-seconds")]
     request_timeout_seconds: Option<u64>,
     #[arg(long = "connect-retries")]

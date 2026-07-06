@@ -36,6 +36,9 @@ pub(super) async fn health(args: HealthArgs, profile: &ClientProfile) -> Result<
             let client = build_http_client_from_tls(
                 args.request_timeout_seconds
                     .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECONDS),
+                args.socks5_hostname
+                    .as_deref()
+                    .or(profile.socks5_hostname.as_deref()),
                 args.tls_ca_cert.as_ref(),
                 args.tls_insecure_skip_verify,
                 &headers,

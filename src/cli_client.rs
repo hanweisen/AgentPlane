@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Certificate, Client, ClientBuilder, StatusCode};
+use reqwest::{Certificate, Client, ClientBuilder, Proxy, StatusCode};
 
 use crate::config::ResolvedClientAuth;
 use crate::protocol::{
@@ -87,6 +87,7 @@ pub(crate) async fn post_process_start_with_recovery(
 pub(crate) fn build_http_client(auth: &ResolvedClientAuth) -> Result<Client> {
     build_http_client_from_tls(
         auth.request_timeout_seconds,
+        auth.socks5_hostname.as_deref(),
         auth.tls_ca_cert.as_ref(),
         auth.tls_insecure_skip_verify,
         &auth.header,
@@ -95,6 +96,7 @@ pub(crate) fn build_http_client(auth: &ResolvedClientAuth) -> Result<Client> {
 
 pub(crate) fn build_http_client_from_tls(
     request_timeout_seconds: u64,
+    socks5_hostname: Option<&str>,
     tls_ca_cert: Option<&PathBuf>,
     tls_insecure_skip_verify: bool,
     extra_headers: &[String],
@@ -105,6 +107,9 @@ pub(crate) fn build_http_client_from_tls(
         .connect_timeout(Duration::from_secs(connect_timeout_seconds))
         .http1_only()
         .tcp_nodelay(true);
+    if let Some(proxy) = socks5_hostname {
+        builder = builder.proxy(Proxy::all(normalize_socks5_proxy_url(proxy)?)?);
+    }
     if tls_insecure_skip_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -119,6 +124,17 @@ pub(crate) fn build_http_client_from_tls(
         builder = builder.default_headers(parse_extra_headers(extra_headers)?);
     }
     Ok(builder.build()?)
+}
+
+fn normalize_socks5_proxy_url(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("--socks5-hostname must not be empty"));
+    }
+    if trimmed.contains("://") {
+        return Ok(trimmed.to_string());
+    }
+    Ok(format!("socks5h://{trimmed}"))
 }
 
 pub(crate) async fn send_with_retry<F>(
@@ -333,6 +349,25 @@ fn format_error_chain(error: &reqwest::Error) -> String {
         message.push_str(&causes.join(" -> "));
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_socks5_proxy_url;
+    use anyhow::Result;
+
+    #[test]
+    fn normalize_socks5_proxy_url_adds_remote_dns_scheme() -> Result<()> {
+        assert_eq!(
+            normalize_socks5_proxy_url("127.0.0.1:1086")?,
+            "socks5h://127.0.0.1:1086"
+        );
+        assert_eq!(
+            normalize_socks5_proxy_url("socks5h://127.0.0.1:1086")?,
+            "socks5h://127.0.0.1:1086"
+        );
+        Ok(())
+    }
 }
 
 pub(crate) fn normalize_server_url(url: &str) -> String {

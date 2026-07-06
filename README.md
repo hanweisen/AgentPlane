@@ -175,6 +175,12 @@ AP_REMOTE_ROOT='/workspace/project'
 
 ./agentplane health --server "$AP_SERVER"
 ./agentplane process-list --server "$AP_SERVER" --token "$AP_TOKEN"
+
+# If the service is reachable only through SOCKS5 with remote DNS:
+./agentplane process-list \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --socks5-hostname 127.0.0.1:1086
 ```
 
 For HTTPS with a self-signed certificate, start the server with:
@@ -212,6 +218,7 @@ cat > /tmp/agentplane.env <<'EOF'
 AP_SERVER=https://gateway.example.com/workspaces/dev/agentplane
 AP_TOKEN=replace-with-random-token
 AP_REMOTE_ROOT=/workspace/project
+AP_SOCKS5_HOSTNAME=127.0.0.1:1086
 AP_HEADER_1=X-Workspace-Context: example
 AP_CONNECT_RETRIES=5
 AP_CONNECT_RETRY_DELAY_MS=1000
