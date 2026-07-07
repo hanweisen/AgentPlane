@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -12,16 +12,21 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use super::ServerState;
+use super::auth::ExecutionLease;
 use crate::protocol::{
     CommandResult, FileDeleteRequest, FileFindRequest, FileFindResponse, FileListEntry,
     FileListRequest, FileListResponse, FileReadRequest, FileReadResponse, FileStatRequest,
     FileStatResponse, FileUploadChunkRequest, FileUploadChunkResponse, FileUploadFinishRequest,
     FileUploadInitRequest, FileUploadInitResponse, FileUploadStatusRequest,
-    FileUploadStatusResponse, FileWrite, FileWriteRequest, SimpleResponse, SyncMode, SyncPayload,
-    SyncReport, SyncResponse, relative_path_matches_preserve_path,
+    FileUploadStatusResponse, FileWrite, FileWriteRequest, ResourceClaim, SimpleResponse, SyncMode,
+    SyncPayload, SyncReport, SyncResponse, SyncSessionInitRequest, SyncSessionInitResponse,
+    SyncSessionReleaseRequest, SyncSessionStatusRequest, infer_gpu_resource_claims_from_sync_env,
+    merge_resource_claims, relative_path_matches_preserve_path,
 };
 
 const DEFAULT_SYNC_RUN_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_SYNC_SESSION_TTL_SECONDS: u64 = 300;
+const DEFAULT_SYNC_SESSION_HEARTBEAT_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct UploadSession {
@@ -38,10 +43,38 @@ pub struct UploadSession {
     mode: Option<u32>,
     executable: bool,
     preserve_mode: bool,
+    sync_session_id: Option<String>,
+    lock_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncSession {
+    pub sync_session_id: String,
+    lock_token: String,
+    agent_id: String,
+    remote_root: PathBuf,
+    lock_key: String,
+    ttl_seconds: u64,
+    expires_at: SystemTime,
 }
 
 pub async fn handle_sync_run(state: &ServerState, payload: SyncPayload) -> Result<SyncResponse> {
+    handle_sync_run_with_lease(state, payload, None).await
+}
+
+pub async fn handle_sync_run_with_lease(
+    state: &ServerState,
+    payload: SyncPayload,
+    execution_lease: Option<&ExecutionLease>,
+) -> Result<SyncResponse> {
     let remote_root = resolve_remote_root(&state.allow_roots, &payload.remote_root)?;
+    validate_optional_sync_session(
+        state,
+        &remote_root,
+        payload.sync_session_id.as_deref(),
+        payload.lock_token.as_deref(),
+    )
+    .await?;
     tokio::fs::create_dir_all(&remote_root).await?;
     let report = match payload.sync_mode {
         SyncMode::WorktreeDelta => {
@@ -66,10 +99,13 @@ pub async fn handle_sync_run(state: &ServerState, payload: SyncPayload) -> Resul
     let write_count = report.created.len() + report.updated.len();
     let delete_count = report.deleted.len();
     let result = run_command(
+        state,
         &remote_root,
         payload.command.clone(),
         payload.timeout_seconds,
         payload.env.unwrap_or_default(),
+        payload.claims,
+        execution_lease,
     )
     .await?;
 
@@ -83,6 +119,148 @@ pub async fn handle_sync_run(state: &ServerState, payload: SyncPayload) -> Resul
         preserve_paths: payload.preserve_paths,
         result,
     })
+}
+
+pub async fn handle_sync_session_init(
+    state: &ServerState,
+    payload: SyncSessionInitRequest,
+) -> Result<SyncSessionInitResponse> {
+    let remote_root = resolve_remote_root(&state.allow_roots, &payload.remote_root)?;
+    let lock_key = payload
+        .lock_key
+        .clone()
+        .unwrap_or_else(|| remote_root.display().to_string());
+    let ttl_seconds = payload
+        .ttl_seconds
+        .unwrap_or(DEFAULT_SYNC_SESSION_TTL_SECONDS)
+        .max(1);
+    let now = SystemTime::now();
+    let mut sessions = state.sync_sessions.lock().await;
+    purge_expired_sync_sessions(&mut sessions, now);
+    if let Some(existing) = sessions
+        .values()
+        .find(|session| session.lock_key == lock_key && session.expires_at > now)
+    {
+        if existing.agent_id == payload.agent_id && existing.remote_root == remote_root {
+            let sync_session_id = existing.sync_session_id.clone();
+            let session = sessions
+                .get_mut(&sync_session_id)
+                .ok_or_else(|| anyhow!("sync session disappeared during recovery"))?;
+            session.expires_at = now + StdDuration::from_secs(session.ttl_seconds);
+            return Ok(sync_session_response(session));
+        }
+        bail!(
+            "sync lock held by agent={} session={} lock_key={} expires_at_unix_ms={}",
+            existing.agent_id,
+            existing.sync_session_id,
+            existing.lock_key,
+            unix_ms(existing.expires_at)
+        );
+    }
+
+    let sync_session_id = Uuid::new_v4().to_string();
+    let lock_token = Uuid::new_v4().to_string();
+    let expires_at = now + StdDuration::from_secs(ttl_seconds);
+    let session = SyncSession {
+        sync_session_id: sync_session_id.clone(),
+        lock_token: lock_token.clone(),
+        agent_id: payload.agent_id.clone(),
+        remote_root: remote_root.clone(),
+        lock_key: lock_key.clone(),
+        ttl_seconds,
+        expires_at,
+    };
+    sessions.insert(sync_session_id.clone(), session);
+    Ok(SyncSessionInitResponse {
+        ok: true,
+        sync_session_id,
+        lock_token,
+        agent_id: payload.agent_id,
+        remote_root: remote_root.display().to_string(),
+        lock_key,
+        expires_unix_ms: unix_ms(expires_at),
+        heartbeat_seconds: DEFAULT_SYNC_SESSION_HEARTBEAT_SECONDS,
+    })
+}
+
+pub async fn handle_sync_session_status(
+    state: &ServerState,
+    payload: SyncSessionStatusRequest,
+) -> Result<SyncSessionInitResponse> {
+    let remote_root = resolve_remote_root(&state.allow_roots, &payload.remote_root)?;
+    let lock_key = payload
+        .lock_key
+        .clone()
+        .unwrap_or_else(|| remote_root.display().to_string());
+    let now = SystemTime::now();
+    let mut sessions = state.sync_sessions.lock().await;
+    purge_expired_sync_sessions(&mut sessions, now);
+    let Some(session) = sessions.get_mut(&payload.sync_session_id) else {
+        bail!(
+            "sync session not found or expired: {}",
+            payload.sync_session_id
+        );
+    };
+    if session.lock_token != payload.lock_token {
+        bail!("sync session lock token mismatch");
+    }
+    if session.agent_id != payload.agent_id {
+        bail!(
+            "sync session agent mismatch: expected {}, got {}",
+            session.agent_id,
+            payload.agent_id
+        );
+    }
+    if session.remote_root != remote_root {
+        bail!(
+            "sync session {} does not own remote root {}",
+            session.sync_session_id,
+            remote_root.display()
+        );
+    }
+    if session.lock_key != lock_key {
+        bail!(
+            "sync session lock key mismatch: expected {}, got {}",
+            session.lock_key,
+            lock_key
+        );
+    }
+    session.expires_at = now + StdDuration::from_secs(session.ttl_seconds);
+    Ok(sync_session_response(session))
+}
+
+pub async fn handle_sync_session_release(
+    state: &ServerState,
+    payload: SyncSessionReleaseRequest,
+) -> Result<SimpleResponse> {
+    let mut sessions = state.sync_sessions.lock().await;
+    let Some(session) = sessions.get(&payload.sync_session_id) else {
+        return Ok(SimpleResponse {
+            ok: true,
+            error: None,
+        });
+    };
+    if session.lock_token != payload.lock_token {
+        bail!("sync session lock token mismatch");
+    }
+    sessions.remove(&payload.sync_session_id);
+    Ok(SimpleResponse {
+        ok: true,
+        error: None,
+    })
+}
+
+fn sync_session_response(session: &SyncSession) -> SyncSessionInitResponse {
+    SyncSessionInitResponse {
+        ok: true,
+        sync_session_id: session.sync_session_id.clone(),
+        lock_token: session.lock_token.clone(),
+        agent_id: session.agent_id.clone(),
+        remote_root: session.remote_root.display().to_string(),
+        lock_key: session.lock_key.clone(),
+        expires_unix_ms: unix_ms(session.expires_at),
+        heartbeat_seconds: DEFAULT_SYNC_SESSION_HEARTBEAT_SECONDS,
+    }
 }
 
 pub async fn handle_file_read(
@@ -180,6 +358,13 @@ pub async fn handle_file_upload_init(
         bail!("chunk_size must be greater than zero");
     }
     let remote_root = resolve_remote_root(&state.allow_roots, &payload.remote_root)?;
+    validate_optional_sync_session(
+        state,
+        &remote_root,
+        payload.sync_session_id.as_deref(),
+        payload.lock_token.as_deref(),
+    )
+    .await?;
     let target_path = safe_join(&remote_root, &payload.path)?;
     let staging_path = upload_staging_path(&target_path, &checksum_sha256, payload.atomic)?;
 
@@ -197,6 +382,8 @@ pub async fn handle_file_upload_init(
             && session
                 .checksum_sha256
                 .eq_ignore_ascii_case(&checksum_sha256)
+            && session.sync_session_id == payload.sync_session_id
+            && session.lock_token == payload.lock_token
         {
             existing_upload_id = Some(upload_id.clone());
             break;
@@ -208,6 +395,7 @@ pub async fn handle_file_upload_init(
             .get_mut(&upload_id)
             .ok_or_else(|| anyhow!("upload session disappeared during init"))?;
         ensure_matching_upload_init(session, &payload, &checksum_sha256)?;
+        session.chunk_size = payload.chunk_size;
         session.clone()
     } else {
         let upload_id = Uuid::new_v4().to_string();
@@ -225,6 +413,8 @@ pub async fn handle_file_upload_init(
             mode: payload.mode,
             executable: payload.executable,
             preserve_mode: payload.preserve_mode,
+            sync_session_id: payload.sync_session_id.clone(),
+            lock_token: payload.lock_token.clone(),
         };
         uploads.insert(upload_id, session.clone());
         session
@@ -258,6 +448,13 @@ pub async fn handle_file_upload_chunk(
     payload: FileUploadChunkRequest,
 ) -> Result<FileUploadChunkResponse> {
     let session = get_upload_session(state, &payload.upload_id).await?;
+    validate_upload_session_lock(
+        state,
+        &session,
+        &payload.sync_session_id,
+        &payload.lock_token,
+    )
+    .await?;
     let data = BASE64
         .decode(payload.data_b64.as_bytes())
         .context("failed to decode base64 upload chunk")?;
@@ -311,6 +508,13 @@ pub async fn handle_file_upload_status(
     payload: FileUploadStatusRequest,
 ) -> Result<FileUploadStatusResponse> {
     let session = get_upload_session(state, &payload.upload_id).await?;
+    validate_upload_session_lock(
+        state,
+        &session,
+        &payload.sync_session_id,
+        &payload.lock_token,
+    )
+    .await?;
     let received_bytes = upload_current_size(&session).await?;
     Ok(FileUploadStatusResponse {
         ok: true,
@@ -326,6 +530,13 @@ pub async fn handle_file_upload_finish(
     payload: FileUploadFinishRequest,
 ) -> Result<SimpleResponse> {
     let session = get_upload_session(state, &payload.upload_id).await?;
+    validate_upload_session_lock(
+        state,
+        &session,
+        &payload.sync_session_id,
+        &payload.lock_token,
+    )
+    .await?;
     let received_bytes = upload_current_size(&session).await?;
     if received_bytes != session.total_size {
         bail!(
@@ -385,10 +596,16 @@ pub async fn handle_file_upload_abort(
     state: &ServerState,
     payload: crate::protocol::FileUploadAbortRequest,
 ) -> Result<SimpleResponse> {
+    let session = get_upload_session(state, &payload.upload_id).await?;
+    validate_upload_session_lock(
+        state,
+        &session,
+        &payload.sync_session_id,
+        &payload.lock_token,
+    )
+    .await?;
     let mut uploads = state.uploads.lock().await;
-    let Some(session) = uploads.remove(&payload.upload_id) else {
-        bail!("upload not found: {}", payload.upload_id);
-    };
+    uploads.remove(&payload.upload_id);
     drop(uploads);
 
     match tokio::fs::remove_file(&session.staging_path).await {
@@ -409,7 +626,6 @@ fn ensure_matching_upload_init(
     checksum_sha256: &str,
 ) -> Result<()> {
     if session.total_size != payload.total_size
-        || session.chunk_size != payload.chunk_size
         || session.atomic != payload.atomic
         || session.mode != payload.mode
         || session.executable != payload.executable
@@ -433,6 +649,88 @@ async fn get_upload_session(state: &ServerState, upload_id: &str) -> Result<Uplo
         .get(upload_id)
         .cloned()
         .ok_or_else(|| anyhow!("upload not found: {upload_id}"))
+}
+
+async fn validate_upload_session_lock(
+    state: &ServerState,
+    upload: &UploadSession,
+    sync_session_id: &Option<String>,
+    lock_token: &Option<String>,
+) -> Result<()> {
+    if upload.sync_session_id.is_none() {
+        return Ok(());
+    }
+    if &upload.sync_session_id != sync_session_id || &upload.lock_token != lock_token {
+        bail!("upload sync session mismatch for {}", upload.path);
+    }
+    validate_required_sync_session(
+        state,
+        &upload.target_path,
+        sync_session_id.as_deref(),
+        lock_token.as_deref(),
+    )
+    .await
+}
+
+async fn validate_optional_sync_session(
+    state: &ServerState,
+    remote_root: &Path,
+    sync_session_id: Option<&str>,
+    lock_token: Option<&str>,
+) -> Result<()> {
+    match (sync_session_id, lock_token) {
+        (Some(sync_session_id), Some(lock_token)) => {
+            validate_required_sync_session(
+                state,
+                remote_root,
+                Some(sync_session_id),
+                Some(lock_token),
+            )
+            .await
+        }
+        (None, None) => Ok(()),
+        _ => bail!("sync session id and lock token must be provided together"),
+    }
+}
+
+async fn validate_required_sync_session(
+    state: &ServerState,
+    remote_root_or_child: &Path,
+    sync_session_id: Option<&str>,
+    lock_token: Option<&str>,
+) -> Result<()> {
+    let sync_session_id = sync_session_id.ok_or_else(|| anyhow!("sync session id is required"))?;
+    let lock_token = lock_token.ok_or_else(|| anyhow!("sync session lock token is required"))?;
+    let now = SystemTime::now();
+    let mut sessions = state.sync_sessions.lock().await;
+    purge_expired_sync_sessions(&mut sessions, now);
+    let Some(session) = sessions.get_mut(sync_session_id) else {
+        bail!("sync session not found or expired: {sync_session_id}");
+    };
+    if session.lock_token != lock_token {
+        bail!("sync session lock token mismatch");
+    }
+    if !(remote_root_or_child == session.remote_root
+        || remote_root_or_child.starts_with(&session.remote_root))
+    {
+        bail!(
+            "sync session {} does not own remote root {}",
+            sync_session_id,
+            remote_root_or_child.display()
+        );
+    }
+    session.expires_at = now + StdDuration::from_secs(session.ttl_seconds);
+    Ok(())
+}
+
+fn purge_expired_sync_sessions(sessions: &mut BTreeMap<String, SyncSession>, now: SystemTime) {
+    sessions.retain(|_, session| session.expires_at > now);
+}
+
+fn unix_ms(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| StdDuration::from_secs(0))
+        .as_millis()
 }
 
 fn upload_staging_path(target_path: &Path, checksum_sha256: &str, atomic: bool) -> Result<PathBuf> {
@@ -649,6 +947,18 @@ async fn apply_changes(
 
     for write in writes {
         let target = safe_join(remote_root, &write.path)?;
+        if write.preuploaded {
+            let outcome = validate_preuploaded_file(&target, write, &options).await?;
+            match outcome {
+                WriteOutcome::Skipped => report.skipped.push(write.path.clone()),
+                WriteOutcome::Written if write.preupload_existed => {
+                    report.updated.push(write.path.clone());
+                }
+                WriteOutcome::Written => report.created.push(write.path.clone()),
+            }
+            continue;
+        }
+
         let content = BASE64
             .decode(write.content_b64.as_bytes())
             .context("failed to decode base64 content")?;
@@ -689,6 +999,49 @@ async fn apply_changes(
     }
 
     Ok(report)
+}
+
+async fn validate_preuploaded_file(
+    target: &Path,
+    write: &FileWrite,
+    options: &SyncWriteOptions,
+) -> Result<WriteOutcome> {
+    let metadata = tokio::fs::metadata(target)
+        .await
+        .with_context(|| format!("preuploaded file is missing: {}", target.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "preuploaded path is not a regular file: {}",
+            target.display()
+        );
+    }
+    let expected_sha256 = write
+        .checksum_sha256
+        .as_deref()
+        .ok_or_else(|| anyhow!("preuploaded file is missing checksum: {}", write.path))
+        .map(normalize_sha256)?;
+    validate_sha256(&expected_sha256)?;
+    let actual_sha256 = hash_file_sha256(target).await?;
+    if !actual_sha256.eq_ignore_ascii_case(&expected_sha256) {
+        bail!("preuploaded checksum mismatch for {}", write.path);
+    }
+
+    apply_write_mode(
+        target,
+        if options.preserve_mode {
+            write.mode
+        } else {
+            None
+        },
+        write.executable,
+    )
+    .await?;
+
+    if write.preupload_skipped {
+        Ok(WriteOutcome::Skipped)
+    } else {
+        Ok(WriteOutcome::Written)
+    }
 }
 
 async fn apply_snapshot(
@@ -1107,10 +1460,13 @@ async fn set_executable(path: &Path, executable: bool) -> Result<()> {
 }
 
 async fn run_command(
+    state: &ServerState,
     remote_root: &Path,
     command: Option<String>,
     timeout_seconds: u64,
     env: BTreeMap<String, String>,
+    claims: Vec<ResourceClaim>,
+    execution_lease: Option<&ExecutionLease>,
 ) -> Result<CommandResult> {
     let Some(command_text) = command.clone() else {
         return Ok(CommandResult {
@@ -1121,13 +1477,45 @@ async fn run_command(
         });
     };
 
+    let claimed_resources = if execution_lease.is_some() {
+        merge_resource_claims(&claims, &infer_gpu_resource_claims_from_sync_env(&env))?
+    } else {
+        Vec::new()
+    };
+    let claim_process_id = execution_lease.map(|lease| {
+        format!(
+            "sync-command:{}/{}/{}",
+            lease.task_id,
+            lease.lease_id,
+            remote_root.display()
+        )
+    });
+    if let (Some(lease), Some(process_id)) = (execution_lease, claim_process_id.as_deref()) {
+        let mut modes = state.modes.lock().await;
+        modes.claim_resources(
+            &lease.task_id,
+            &lease.lease_id,
+            process_id,
+            &claimed_resources,
+        )?;
+    }
+
     let mut child = Command::new("bash");
     child.arg("-lc").arg(&command_text).current_dir(remote_root);
     child.envs(env);
     child.stdout(std::process::Stdio::piped());
     child.stderr(std::process::Stdio::piped());
 
-    let mut child = child.spawn().context("failed to spawn command")?;
+    let mut child = match child.spawn().context("failed to spawn command") {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(process_id) = claim_process_id.as_deref() {
+                let mut modes = state.modes.lock().await;
+                modes.release_process_resource_claims(process_id);
+            }
+            return Err(error);
+        }
+    };
     let stdout = child.stdout.take().context("missing child stdout")?;
     let stderr = child.stderr.take().context("missing child stderr")?;
 
@@ -1143,6 +1531,10 @@ async fn run_command(
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
+            if let Some(process_id) = claim_process_id.as_deref() {
+                let mut modes = state.modes.lock().await;
+                modes.release_process_resource_claims(process_id);
+            }
             bail!("command timed out after {timeout_seconds} seconds");
         }
     };
@@ -1151,6 +1543,11 @@ async fn run_command(
         stdout_task.await.context("stdout task join failed")??;
     let (stderr_bytes, stderr_truncated) =
         stderr_task.await.context("stderr task join failed")??;
+
+    if let Some(process_id) = claim_process_id.as_deref() {
+        let mut modes = state.modes.lock().await;
+        modes.release_process_resource_claims(process_id);
+    }
 
     Ok(CommandResult {
         exit_code: status.code().unwrap_or(1),

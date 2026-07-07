@@ -1,6 +1,9 @@
 mod common;
 
-use agentplane::git::{collect_repo_changes, collect_repo_snapshot, parse_env_pairs, resolve_ref};
+use agentplane::git::{
+    collect_repo_changes, collect_repo_snapshot, collect_repo_worktree_snapshot, parse_env_pairs,
+    resolve_ref,
+};
 use agentplane::protocol::{SyncMode, SyncPayload};
 use agentplane::server::{ServerState, handle_sync_run};
 use base64::Engine;
@@ -36,6 +39,42 @@ fn collect_repo_changes_handles_modified_untracked_and_deleted() -> Result<()> {
     assert!(paths.contains(&"new.txt".to_string()));
     assert!(!paths.contains(&"ignored.tmp".to_string()));
     assert_eq!(deletes, vec!["delete-me.txt".to_string()]);
+    Ok(())
+}
+
+#[test]
+fn collect_repo_worktree_snapshot_uses_current_project_files() -> Result<()> {
+    let repo = init_repo()?;
+    std::fs::write(repo.path().join(".gitignore"), "ignored.tmp\n")?;
+    std::fs::write(repo.path().join("tracked.txt"), "old\n")?;
+    std::fs::write(repo.path().join("deleted.txt"), "delete\n")?;
+    git(
+        repo.path(),
+        &["add", ".gitignore", "tracked.txt", "deleted.txt"],
+    )?;
+    git(repo.path(), &["commit", "-m", "init"])?;
+
+    std::fs::write(repo.path().join("tracked.txt"), "current\n")?;
+    std::fs::write(repo.path().join("untracked.txt"), "new\n")?;
+    std::fs::write(repo.path().join("ignored.tmp"), "ignore\n")?;
+    std::fs::remove_file(repo.path().join("deleted.txt"))?;
+
+    let writes = collect_repo_worktree_snapshot(repo.path())?;
+    let paths = writes
+        .iter()
+        .map(|item| item.path.as_str())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&".gitignore"));
+    assert!(paths.contains(&"tracked.txt"));
+    assert!(paths.contains(&"untracked.txt"));
+    assert!(!paths.contains(&"ignored.tmp"));
+    assert!(!paths.contains(&"deleted.txt"));
+    let tracked = writes
+        .iter()
+        .find(|item| item.path == "tracked.txt")
+        .expect("tracked write");
+    let tracked_content = BASE64.decode(tracked.content_b64.as_bytes())?;
+    assert_eq!(tracked_content, b"current\n");
     Ok(())
 }
 
@@ -83,9 +122,12 @@ async fn sync_run_round_trip_with_env_and_exec_bit() -> Result<()> {
         ),
         timeout_seconds: 30,
         env: Some(std::iter::once(("DEMO_FLAG".to_string(), "from-env".to_string())).collect()),
+        claims: Vec::new(),
         checksum: false,
         preserve_mode: false,
         atomic_files: false,
+        sync_session_id: None,
+        lock_token: None,
     };
 
     let response = handle_sync_run(&state, payload).await?;
@@ -113,6 +155,9 @@ async fn sync_run_rejects_escape_and_allow_list_violation() -> Result<()> {
             executable: false,
             mode: None,
             checksum_sha256: None,
+            preuploaded: false,
+            preupload_existed: false,
+            preupload_skipped: false,
         }],
         deletes: vec![],
         sync_mode: SyncMode::WorktreeDelta,
@@ -121,9 +166,12 @@ async fn sync_run_rejects_escape_and_allow_list_violation() -> Result<()> {
         command: None,
         timeout_seconds: 30,
         env: Some(Default::default()),
+        claims: Vec::new(),
         checksum: false,
         preserve_mode: false,
         atomic_files: false,
+        sync_session_id: None,
+        lock_token: None,
     };
     assert!(handle_sync_run(&state, payload).await.is_err());
 
@@ -137,9 +185,12 @@ async fn sync_run_rejects_escape_and_allow_list_violation() -> Result<()> {
         command: None,
         timeout_seconds: 30,
         env: Some(Default::default()),
+        claims: Vec::new(),
         checksum: false,
         preserve_mode: false,
         atomic_files: false,
+        sync_session_id: None,
+        lock_token: None,
     };
     assert!(handle_sync_run(&state, payload).await.is_err());
     Ok(())
@@ -169,9 +220,12 @@ async fn sync_run_allows_remote_root_equal_to_allow_root_even_if_missing_before_
         command: Some("cat main.txt".to_string()),
         timeout_seconds: 30,
         env: Some(Default::default()),
+        claims: Vec::new(),
         checksum: false,
         preserve_mode: false,
         atomic_files: false,
+        sync_session_id: None,
+        lock_token: None,
     };
 
     let response = handle_sync_run(&state, payload).await?;
@@ -203,9 +257,12 @@ async fn sync_run_limits_large_command_output() -> Result<()> {
         ),
         timeout_seconds: 30,
         env: Some(Default::default()),
+        claims: Vec::new(),
         checksum: false,
         preserve_mode: false,
         atomic_files: false,
+        sync_session_id: None,
+        lock_token: None,
     };
 
     let response = handle_sync_run(&state, payload).await?;
@@ -294,15 +351,21 @@ async fn sync_run_ref_snapshot_exactly_replaces_remote_tree_and_preserves_whitel
                 path: "src/main.rs".to_string(),
                 content_b64: BASE64.encode("fn main() {}\n"),
                 executable: false,
-            mode: None,
-            checksum_sha256: None,
+                mode: None,
+                checksum_sha256: None,
+                preuploaded: false,
+                preupload_existed: false,
+                preupload_skipped: false,
             },
             agentplane::protocol::FileWrite {
                 path: "README.md".to_string(),
                 content_b64: BASE64.encode("hello\n"),
                 executable: false,
-            mode: None,
-            checksum_sha256: None,
+                mode: None,
+                checksum_sha256: None,
+                preuploaded: false,
+                preupload_existed: false,
+                preupload_skipped: false,
             },
         ],
         deletes: vec![],
@@ -312,9 +375,12 @@ async fn sync_run_ref_snapshot_exactly_replaces_remote_tree_and_preserves_whitel
         command: Some("test -f src/main.rs && test ! -e src/stale.rs && test -f target/debug/cache.bin && cat README.md".to_string()),
         timeout_seconds: 30,
         env: Some(Default::default()),
+        claims: Vec::new(),
         checksum: false,
         preserve_mode: false,
         atomic_files: false,
+        sync_session_id: None,
+        lock_token: None,
     };
 
     let response = handle_sync_run(&state, payload).await?;
@@ -361,9 +427,12 @@ async fn sync_run_ref_snapshot_preserve_path_does_not_block_sibling_deletes() ->
         command: None,
         timeout_seconds: 30,
         env: Some(Default::default()),
+        claims: Vec::new(),
         checksum: false,
         preserve_mode: false,
         atomic_files: false,
+        sync_session_id: None,
+        lock_token: None,
     };
 
     let response = handle_sync_run(&state, payload).await?;
@@ -398,6 +467,9 @@ async fn sync_run_checksum_skips_identical_files_and_reports_write_categories() 
                 executable: false,
                 mode: Some(0o644),
                 checksum_sha256: Some(test_sha256_hex(b"same\n")),
+                preuploaded: false,
+                preupload_existed: false,
+                preupload_skipped: false,
             },
             agentplane::protocol::FileWrite {
                 path: "changed.txt".to_string(),
@@ -405,6 +477,9 @@ async fn sync_run_checksum_skips_identical_files_and_reports_write_categories() 
                 executable: false,
                 mode: Some(0o644),
                 checksum_sha256: Some(test_sha256_hex(b"new\n")),
+                preuploaded: false,
+                preupload_existed: false,
+                preupload_skipped: false,
             },
             agentplane::protocol::FileWrite {
                 path: "created.txt".to_string(),
@@ -412,6 +487,9 @@ async fn sync_run_checksum_skips_identical_files_and_reports_write_categories() 
                 executable: false,
                 mode: Some(0o644),
                 checksum_sha256: Some(test_sha256_hex(b"created\n")),
+                preuploaded: false,
+                preupload_existed: false,
+                preupload_skipped: false,
             },
         ],
         deletes: vec!["delete.txt".to_string()],
@@ -421,9 +499,12 @@ async fn sync_run_checksum_skips_identical_files_and_reports_write_categories() 
         command: None,
         timeout_seconds: 30,
         env: Some(Default::default()),
+        claims: Vec::new(),
         checksum: true,
         preserve_mode: true,
         atomic_files: true,
+        sync_session_id: None,
+        lock_token: None,
     };
 
     let response = handle_sync_run(&state, payload).await?;
@@ -540,6 +621,99 @@ fn cli_sync_run_no_changes_still_executes_command() -> Result<()> {
             .unwrap_or_default()
             .contains("same")
     );
+    Ok(())
+}
+
+#[test]
+fn cli_sync_run_transfers_large_file_with_upload_chunks() -> Result<()> {
+    let local_repo = init_repo()?;
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let content = (0..(2 * 1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    std::fs::write(local_repo.path().join("large.bin"), &content)?;
+
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+    let sync = run_cli(&[
+        "sync-run",
+        "--repo",
+        &local_repo.path().display().to_string(),
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--upload-chunk-size",
+        "4096",
+        "--checksum",
+        "--command",
+        "test -s large.bin",
+    ])?;
+    assert!(
+        sync.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    let sync_body: serde_json::Value = serde_json::from_slice(&sync.stdout)?;
+    assert_eq!(sync_body["ok"], true);
+    assert_eq!(sync_body["write_count"], 1);
+    assert_eq!(
+        std::fs::read(remote_root.path().join("large.bin"))?,
+        content
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_sync_init_initializes_remote_directory_from_current_git_project() -> Result<()> {
+    let local_repo = init_repo()?;
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+
+    std::fs::write(local_repo.path().join(".gitignore"), "ignored.tmp\n")?;
+    std::fs::write(local_repo.path().join("tracked.txt"), "old\n")?;
+    git(local_repo.path(), &["add", ".gitignore", "tracked.txt"])?;
+    git(local_repo.path(), &["commit", "-m", "init"])?;
+    std::fs::write(local_repo.path().join("tracked.txt"), "current\n")?;
+    std::fs::write(local_repo.path().join("untracked.txt"), "new\n")?;
+    std::fs::write(local_repo.path().join("ignored.tmp"), "ignore\n")?;
+    std::fs::write(remote_root.path().join("stale.txt"), "stale\n")?;
+
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+    let sync = run_cli(&[
+        "sync-init",
+        "--repo",
+        &local_repo.path().display().to_string(),
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--upload-chunk-size",
+        "4096",
+        "--checksum",
+    ])?;
+    assert!(
+        sync.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    let sync_body: serde_json::Value = serde_json::from_slice(&sync.stdout)?;
+    assert_eq!(sync_body["ok"], true);
+    assert_eq!(sync_body["source_ref"], "worktree");
+    assert_eq!(
+        std::fs::read_to_string(remote_root.path().join("tracked.txt"))?,
+        "current\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(remote_root.path().join("untracked.txt"))?,
+        "new\n"
+    );
+    assert!(!remote_root.path().join("ignored.tmp").exists());
+    assert!(!remote_root.path().join("stale.txt").exists());
     Ok(())
 }
 

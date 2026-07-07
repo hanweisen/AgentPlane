@@ -3,20 +3,29 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::StatusCode;
+use sha2::{Digest, Sha256};
 
-use crate::cli_client::{post_json, print_error_response, process_error_response};
+use crate::cli_client::{
+    build_http_client, post_json, post_json_with_client, print_error_response,
+    process_error_response,
+};
 use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
 use crate::git::{
     collect_repo_changes, collect_repo_changes_between_refs, collect_repo_snapshot,
-    parse_env_pairs, resolve_ref, resolve_repo_root,
+    collect_repo_worktree_snapshot, parse_env_pairs, resolve_ref, resolve_repo_root,
 };
 use crate::protocol::{
-    FileListEntry, FileListRequest, FileListResponse, FileWrite, SyncMode, SyncPayload,
-    SyncResponse, relative_path_matches_preserve_path,
+    FileListEntry, FileListRequest, FileListResponse, FileStatRequest, FileStatResponse, FileWrite,
+    SyncMode, SyncPayload, SyncResponse, SyncSessionInitResponse, parse_resource_claim_specs,
+    relative_path_matches_preserve_path,
 };
 
-use super::SyncRunArgs;
+use super::file::{UploadBytesOptions, upload_bytes};
+use super::sync_session::{acquire_sync_session, release_sync_session};
+use super::{SyncInitArgs, SyncRunArgs};
 
 pub(super) async fn sync_run(args: SyncRunArgs, profile: &ClientProfile) -> Result<ExitCode> {
     let auth = args.auth.resolve(profile)?;
@@ -68,6 +77,7 @@ pub(super) async fn sync_run(args: SyncRunArgs, profile: &ClientProfile) -> Resu
     let exclude_patterns = load_exclude_patterns(&args.exclude_from)?;
     filter_sync_paths(&mut writes, &mut deletes, &args.include, &exclude_patterns);
     let env = parse_env_pairs(&args.env)?;
+    let claims = parse_resource_claim_specs(&args.claims)?;
     let dry_run_delete_preview = if args.dry_run && matches!(sync_mode, SyncMode::RefSnapshot) {
         Some(
             preview_ref_snapshot_deletes(
@@ -81,8 +91,9 @@ pub(super) async fn sync_run(args: SyncRunArgs, profile: &ClientProfile) -> Resu
     } else {
         None
     };
+    let remote_root_string = remote_root.display().to_string();
     let payload = SyncPayload {
-        remote_root: remote_root.display().to_string(),
+        remote_root: remote_root_string.clone(),
         writes,
         deletes,
         sync_mode,
@@ -91,9 +102,12 @@ pub(super) async fn sync_run(args: SyncRunArgs, profile: &ClientProfile) -> Resu
         command: args.command.clone(),
         timeout_seconds: args.timeout_seconds,
         env: Some(env),
+        claims,
         checksum: args.checksum,
         preserve_mode: args.preserve_mode,
         atomic_files: args.atomic_files,
+        sync_session_id: None,
+        lock_token: None,
     };
 
     if args.dry_run {
@@ -130,12 +144,140 @@ pub(super) async fn sync_run(args: SyncRunArgs, profile: &ClientProfile) -> Resu
             "deletes": dry_run_delete_preview.unwrap_or(payload.deletes),
             "command": payload.command,
             "env": payload.env,
+            "claims": payload.claims,
         });
         println!("{}", serde_json::to_string_pretty(&preview)?);
         return Ok(ExitCode::SUCCESS);
     }
 
-    let response = post_json(&auth, "/v1/sync-run", &payload, false).await?;
+    send_locked_sync_payload(
+        &auth,
+        &remote_root_string,
+        payload,
+        args.upload_chunk_size,
+        args.checksum,
+        args.preserve_mode,
+    )
+    .await
+}
+
+pub(super) async fn sync_init(args: SyncInitArgs, profile: &ClientProfile) -> Result<ExitCode> {
+    let auth = args.auth.resolve(profile)?;
+    let remote_root = resolve_remote_root(args.remote_root.as_ref(), profile)?;
+    let repo_root = resolve_repo_root(&args.repo)?;
+    let writes = collect_repo_worktree_snapshot(&repo_root)?;
+    let remote_root_string = remote_root.display().to_string();
+    let dry_run_delete_preview = if args.dry_run {
+        Some(
+            preview_ref_snapshot_deletes(&auth, &remote_root_string, &writes, &args.preserve_path)
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    let payload = SyncPayload {
+        remote_root: remote_root_string.clone(),
+        writes,
+        deletes: Vec::new(),
+        sync_mode: SyncMode::RefSnapshot,
+        source_ref: Some("worktree".to_string()),
+        preserve_paths: args.preserve_path.clone(),
+        command: None,
+        timeout_seconds: 0,
+        env: Some(Default::default()),
+        claims: Vec::new(),
+        checksum: args.checksum,
+        preserve_mode: args.preserve_mode,
+        atomic_files: args.atomic_files,
+        sync_session_id: None,
+        lock_token: None,
+    };
+
+    if args.dry_run {
+        let write_details = payload
+            .writes
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "path": item.path,
+                    "executable": item.executable,
+                    "mode": item.mode.map(|mode| format!("{mode:o}")),
+                    "sha256": if args.checksum { item.checksum_sha256.clone() } else { None },
+                })
+            })
+            .collect::<Vec<_>>();
+        let preview = serde_json::json!({
+            "repo_root": repo_root.display().to_string(),
+            "sync_mode": payload.sync_mode,
+            "source_ref": payload.source_ref,
+            "preserve_paths": payload.preserve_paths,
+            "exact_sync": true,
+            "checksum": payload.checksum,
+            "preserve_mode": payload.preserve_mode,
+            "atomic_files": payload.atomic_files,
+            "write_count": payload.writes.len(),
+            "delete_count": dry_run_delete_preview
+                .as_ref()
+                .map(|preview| preview.len())
+                .unwrap_or_default(),
+            "writes": payload.writes.iter().map(|item| item.path.clone()).collect::<Vec<_>>(),
+            "write_details": write_details,
+            "deletes": dry_run_delete_preview.unwrap_or_default(),
+            "command": payload.command,
+            "env": payload.env,
+            "claims": payload.claims,
+        });
+        println!("{}", serde_json::to_string_pretty(&preview)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    send_locked_sync_payload(
+        &auth,
+        &remote_root_string,
+        payload,
+        args.upload_chunk_size,
+        args.checksum,
+        args.preserve_mode,
+    )
+    .await
+}
+
+async fn send_locked_sync_payload(
+    auth: &ResolvedClientAuth,
+    remote_root: &str,
+    mut payload: SyncPayload,
+    upload_chunk_size: usize,
+    checksum: bool,
+    preserve_mode: bool,
+) -> Result<ExitCode> {
+    let session = acquire_sync_session(auth, remote_root, None).await?;
+    payload.sync_session_id = Some(session.sync_session_id.clone());
+    payload.lock_token = Some(session.lock_token.clone());
+
+    let result = async {
+        preupload_sync_writes(
+            auth,
+            remote_root,
+            &mut payload.writes,
+            upload_chunk_size,
+            checksum,
+            preserve_mode,
+            &session,
+        )
+        .await?;
+        post_sync_payload(auth, &payload).await
+    }
+    .await;
+
+    if let Err(error) = release_sync_session(auth, &session).await {
+        eprintln!("warning: failed to release sync session: {error:#}");
+    }
+    result
+}
+
+async fn post_sync_payload(auth: &ResolvedClientAuth, payload: &SyncPayload) -> Result<ExitCode> {
+    let response = post_json(auth, "/v1/sync-run", payload, false).await?;
     if response.status() == StatusCode::OK {
         let body: SyncResponse = response.json().await?;
         println!("{}", serde_json::to_string_pretty(&body)?);
@@ -146,6 +288,111 @@ pub(super) async fn sync_run(args: SyncRunArgs, profile: &ClientProfile) -> Resu
         });
     }
     print_error_response(response).await
+}
+
+async fn preupload_sync_writes(
+    auth: &ResolvedClientAuth,
+    remote_root: &str,
+    writes: &mut [FileWrite],
+    chunk_size: usize,
+    checksum: bool,
+    preserve_mode: bool,
+    session: &SyncSessionInitResponse,
+) -> Result<()> {
+    if chunk_size == 0 {
+        bail!("--upload-chunk-size must be greater than zero");
+    }
+    if writes.is_empty() {
+        return Ok(());
+    }
+
+    let client = build_http_client(auth)?;
+    for write in writes {
+        let stat = read_remote_stat(&client, auth, remote_root, &write.path).await?;
+        let content = BASE64
+            .decode(write.content_b64.as_bytes())
+            .with_context(|| format!("failed to decode sync content for {}", write.path))?;
+        let checksum_sha256 = write
+            .checksum_sha256
+            .clone()
+            .unwrap_or_else(|| sha256_hex(&content));
+        let preupload_existed = stat.exists && stat.file_type == "file";
+        let preupload_skipped = checksum
+            && preupload_existed
+            && stat
+                .sha256
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(&checksum_sha256))
+            && stat_mode_satisfied(&stat, write, preserve_mode);
+
+        upload_bytes(
+            &client,
+            auth,
+            remote_root,
+            &write.path,
+            &content,
+            &UploadBytesOptions {
+                chunk_size,
+                resume: true,
+                executable: write.executable,
+                create_parents: true,
+                atomic: true,
+                mode: if preserve_mode { write.mode } else { None },
+                preserve_mode: false,
+                checksum_sha256: checksum_sha256.clone(),
+                sync_session_id: Some(session.sync_session_id.clone()),
+                lock_token: Some(session.lock_token.clone()),
+            },
+        )
+        .await?;
+
+        write.content_b64.clear();
+        write.checksum_sha256 = Some(checksum_sha256);
+        write.preuploaded = true;
+        write.preupload_existed = preupload_existed;
+        write.preupload_skipped = preupload_skipped;
+    }
+
+    Ok(())
+}
+
+async fn read_remote_stat(
+    client: &reqwest::Client,
+    auth: &ResolvedClientAuth,
+    remote_root: &str,
+    path: &str,
+) -> Result<FileStatResponse> {
+    let response = post_json_with_client(
+        client,
+        auth,
+        "/v1/file/stat",
+        &FileStatRequest {
+            remote_root: remote_root.to_string(),
+            path: path.to_string(),
+        },
+        true,
+    )
+    .await?;
+    if response.status() == StatusCode::OK {
+        return Ok(response.json().await?);
+    }
+    Err(process_error_response(response).await)
+}
+
+fn stat_mode_satisfied(stat: &FileStatResponse, write: &FileWrite, preserve_mode: bool) -> bool {
+    if preserve_mode {
+        return false;
+    }
+    stat.executable == write.executable
+}
+
+fn sha256_hex(content: &[u8]) -> String {
+    let digest = Sha256::digest(content);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
 }
 
 fn load_exclude_patterns(paths: &[PathBuf]) -> Result<Vec<String>> {

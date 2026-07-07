@@ -5,16 +5,133 @@ use std::time::Duration;
 use agentplane::protocol::{
     FileDeleteRequest, FileFindRequest, FileListRequest, FileReadRequest, FileStatRequest,
     FileUploadChunkRequest, FileUploadFinishRequest, FileUploadInitRequest,
-    FileUploadStatusRequest, FileWriteRequest,
+    FileUploadStatusRequest, FileWriteRequest, SyncSessionInitRequest, SyncSessionReleaseRequest,
+    SyncSessionStatusRequest,
 };
 use agentplane::server::{
     ServerState, handle_file_delete, handle_file_find, handle_file_list, handle_file_read,
     handle_file_stat, handle_file_upload_chunk, handle_file_upload_finish, handle_file_upload_init,
-    handle_file_upload_status, handle_file_write,
+    handle_file_upload_status, handle_file_write, handle_sync_session_init,
+    handle_sync_session_release, handle_sync_session_status,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use common::*;
+
+#[tokio::test]
+async fn sync_session_locks_remote_root_until_release() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+
+    let first = handle_sync_session_init(
+        &state,
+        SyncSessionInitRequest {
+            remote_root: remote_root.path().display().to_string(),
+            agent_id: "agent-a".to_string(),
+            ttl_seconds: Some(60),
+            lock_key: None,
+        },
+    )
+    .await?;
+    let second = handle_sync_session_init(
+        &state,
+        SyncSessionInitRequest {
+            remote_root: remote_root.path().display().to_string(),
+            agent_id: "agent-b".to_string(),
+            ttl_seconds: Some(60),
+            lock_key: None,
+        },
+    )
+    .await;
+    assert!(second.is_err());
+    assert!(format!("{:#}", second.unwrap_err()).contains("agent=agent-a"));
+
+    let recovered = handle_sync_session_init(
+        &state,
+        SyncSessionInitRequest {
+            remote_root: remote_root.path().display().to_string(),
+            agent_id: "agent-a".to_string(),
+            ttl_seconds: Some(60),
+            lock_key: None,
+        },
+    )
+    .await?;
+    assert_eq!(recovered.sync_session_id, first.sync_session_id);
+    assert_eq!(recovered.lock_token, first.lock_token);
+
+    handle_sync_session_release(
+        &state,
+        SyncSessionReleaseRequest {
+            sync_session_id: recovered.sync_session_id,
+            lock_token: recovered.lock_token,
+        },
+    )
+    .await?;
+    handle_sync_session_init(
+        &state,
+        SyncSessionInitRequest {
+            remote_root: remote_root.path().display().to_string(),
+            agent_id: "agent-b".to_string(),
+            ttl_seconds: Some(60),
+            lock_key: None,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_session_status_recovers_and_refreshes_existing_owner_only() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+
+    let first = handle_sync_session_init(
+        &state,
+        SyncSessionInitRequest {
+            remote_root: remote_root.path().display().to_string(),
+            agent_id: "agent-a".to_string(),
+            ttl_seconds: Some(60),
+            lock_key: Some("upload-key".to_string()),
+        },
+    )
+    .await?;
+    let recovered = handle_sync_session_status(
+        &state,
+        SyncSessionStatusRequest {
+            sync_session_id: first.sync_session_id.clone(),
+            lock_token: first.lock_token.clone(),
+            remote_root: remote_root.path().display().to_string(),
+            agent_id: "agent-a".to_string(),
+            lock_key: Some("upload-key".to_string()),
+        },
+    )
+    .await?;
+    assert_eq!(recovered.sync_session_id, first.sync_session_id);
+    assert_eq!(recovered.lock_token, first.lock_token);
+    assert_eq!(recovered.agent_id, "agent-a");
+    assert_eq!(recovered.lock_key, "upload-key");
+
+    let wrong_agent = handle_sync_session_status(
+        &state,
+        SyncSessionStatusRequest {
+            sync_session_id: recovered.sync_session_id,
+            lock_token: recovered.lock_token,
+            remote_root: remote_root.path().display().to_string(),
+            agent_id: "agent-b".to_string(),
+            lock_key: Some("upload-key".to_string()),
+        },
+    )
+    .await;
+    assert!(wrong_agent.is_err());
+    assert!(format!("{:#}", wrong_agent.unwrap_err()).contains("agent mismatch"));
+    Ok(())
+}
 
 #[tokio::test]
 async fn file_operations_round_trip_cover_write_read_list_find_delete_and_guards() -> Result<()> {
@@ -161,6 +278,8 @@ async fn file_upload_resume_round_trip_preserves_content_and_mode() -> Result<()
             preserve_mode: false,
             checksum_sha256: checksum.clone(),
             resume: false,
+            sync_session_id: None,
+            lock_token: None,
         },
     )
     .await?;
@@ -174,6 +293,8 @@ async fn file_upload_resume_round_trip_preserves_content_and_mode() -> Result<()
             offset: 0,
             data_b64: BASE64.encode(first),
             chunk_checksum_sha256: Some(test_sha256_hex(first)),
+            sync_session_id: None,
+            lock_token: None,
         },
     )
     .await?;
@@ -193,6 +314,8 @@ async fn file_upload_resume_round_trip_preserves_content_and_mode() -> Result<()
             preserve_mode: false,
             checksum_sha256: checksum.clone(),
             resume: true,
+            sync_session_id: None,
+            lock_token: None,
         },
     )
     .await?;
@@ -203,6 +326,8 @@ async fn file_upload_resume_round_trip_preserves_content_and_mode() -> Result<()
         &state,
         FileUploadStatusRequest {
             upload_id: init.upload_id.clone(),
+            sync_session_id: None,
+            lock_token: None,
         },
     )
     .await?;
@@ -216,6 +341,8 @@ async fn file_upload_resume_round_trip_preserves_content_and_mode() -> Result<()
             offset: 5,
             data_b64: BASE64.encode(second),
             chunk_checksum_sha256: Some(test_sha256_hex(second)),
+            sync_session_id: None,
+            lock_token: None,
         },
     )
     .await?;
@@ -223,6 +350,8 @@ async fn file_upload_resume_round_trip_preserves_content_and_mode() -> Result<()
         &state,
         FileUploadFinishRequest {
             upload_id: init.upload_id,
+            sync_session_id: None,
+            lock_token: None,
         },
     )
     .await?;
@@ -809,6 +938,8 @@ fn cli_file_upload_transfers_large_local_file_in_chunks() -> Result<()> {
         "--checksum",
         &format!("sha256:{checksum}"),
         "--resume",
+        "--lock-key",
+        "nested/chunked.bin",
     ])?;
     assert!(file_upload.status.success());
 

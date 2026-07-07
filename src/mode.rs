@@ -1,14 +1,28 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 
-use crate::protocol::{AgentLease, AgentMode, LeaseStatus};
+use crate::protocol::{AgentLease, AgentMode, LeaseStatus, ResourceClaim, format_resource_claim};
 
 #[derive(Debug, Default)]
 pub struct ModeRegistry {
     current_mode: AgentMode,
     leases: BTreeMap<(String, String), AgentLease>,
+    resource_claims: BTreeMap<ResourceClaimKey, ActiveResourceClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ResourceClaimKey {
+    kind: String,
+    unit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveResourceClaim {
+    task_id: String,
+    lease_id: String,
+    process_id: String,
 }
 
 impl ModeRegistry {
@@ -32,6 +46,7 @@ impl ModeRegistry {
                 lease.released_at_unix_ms = Some(now);
             }
         }
+        self.prune_inactive_resource_claims();
     }
 
     pub fn switch_mode(
@@ -45,7 +60,10 @@ impl ModeRegistry {
     ) -> Result<Option<AgentLease>> {
         self.current_mode = mode.clone();
         match mode {
-            AgentMode::Single => Ok(None),
+            AgentMode::Single => {
+                self.resource_claims.clear();
+                Ok(None)
+            }
             AgentMode::Shared => {
                 let task_id =
                     task_id.ok_or_else(|| anyhow::anyhow!("task_id is required in shared mode"))?;
@@ -96,7 +114,16 @@ impl ModeRegistry {
             .get(&(task_id.to_string(), lease_id.to_string()))
             .ok_or_else(|| anyhow::anyhow!("unknown lease: {task_id}/{lease_id}"))?;
         if lease.status != LeaseStatus::Active {
-            bail!("lease is not active: {task_id}/{lease_id}");
+            let detail = match lease.status {
+                LeaseStatus::Expired => {
+                    "lease expired; running processes were not auto-terminated, and any resource protection from this lease has already been removed"
+                }
+                LeaseStatus::Released => {
+                    "lease was released; running processes were not auto-terminated, and this lease no longer protects any resource claim"
+                }
+                LeaseStatus::Active => unreachable!("active lease should not take inactive branch"),
+            };
+            bail!("lease is not active: {task_id}/{lease_id}; {detail}");
         }
         Ok(lease.clone())
     }
@@ -110,10 +137,58 @@ impl ModeRegistry {
         lease.status = LeaseStatus::Released;
         lease.released_at_unix_ms = Some(unix_now_ms());
         let released = lease.clone();
+        self.prune_inactive_resource_claims();
         if !self.has_active_leases() {
             self.current_mode = AgentMode::Single;
         }
         Ok(released)
+    }
+
+    pub fn claim_resources(
+        &mut self,
+        task_id: &str,
+        lease_id: &str,
+        process_id: &str,
+        claims: &[ResourceClaim],
+    ) -> Result<()> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+        self.validate_active_lease(task_id, lease_id)?;
+        let requested = flatten_resource_claims(claims);
+        for requested_claim in &requested {
+            if let Some(existing) = self.resource_claims.get(requested_claim) {
+                if existing.task_id == task_id
+                    && existing.lease_id == lease_id
+                    && existing.process_id == process_id
+                {
+                    continue;
+                }
+                let claimed = display_claim(requested_claim);
+                bail!(
+                    "{claimed} is reserved by active lease {}/{} for process {}; this protection lasts only while that lease stays active. If the holder lease expires or is released, the reservation disappears automatically, but the old process is not auto-terminated and may need manual cleanup before you start work.",
+                    existing.task_id,
+                    existing.lease_id,
+                    existing.process_id
+                );
+            }
+        }
+        for requested_claim in requested {
+            self.resource_claims.insert(
+                requested_claim,
+                ActiveResourceClaim {
+                    task_id: task_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    process_id: process_id.to_string(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn release_process_resource_claims(&mut self, process_id: &str) {
+        self.resource_claims
+            .retain(|_, claim| claim.process_id != process_id);
     }
 
     pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<(String, String, String)> {
@@ -137,11 +212,44 @@ impl ModeRegistry {
 }
 
 impl ModeRegistry {
+    fn prune_inactive_resource_claims(&mut self) {
+        self.resource_claims.retain(|_, claim| {
+            self.leases
+                .get(&(claim.task_id.clone(), claim.lease_id.clone()))
+                .is_some_and(|lease| lease.status == LeaseStatus::Active)
+        });
+    }
+
     fn has_active_leases(&self) -> bool {
         self.leases
             .values()
             .any(|lease| lease.status == LeaseStatus::Active)
     }
+}
+
+fn flatten_resource_claims(claims: &[ResourceClaim]) -> BTreeSet<ResourceClaimKey> {
+    claims
+        .iter()
+        .flat_map(|claim| {
+            claim.units.iter().map(|unit| ResourceClaimKey {
+                kind: claim.kind.clone(),
+                unit: unit.clone(),
+            })
+        })
+        .collect()
+}
+
+fn display_claim(claim: &ResourceClaimKey) -> String {
+    if claim.kind == "gpu" {
+        return format!("GPU {}", claim.unit);
+    }
+    if claim.kind == "npu" {
+        return format!("NPU {}", claim.unit);
+    }
+    format_resource_claim(&ResourceClaim {
+        kind: claim.kind.clone(),
+        units: vec![claim.unit.clone()],
+    })
 }
 
 fn unix_now_ms() -> u128 {

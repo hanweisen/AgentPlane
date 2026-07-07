@@ -146,10 +146,47 @@ pub fn collect_repo_changes(repo: &Path) -> Result<(Vec<FileWrite>, Vec<String>)
             executable,
             mode: file_mode(&absolute)?,
             checksum_sha256: Some(sha256_hex(&content)),
+            preuploaded: false,
+            preupload_existed: false,
+            preupload_skipped: false,
         });
     }
 
     Ok((writes, deleted.into_iter().collect()))
+}
+
+pub fn collect_repo_worktree_snapshot(repo: &Path) -> Result<Vec<FileWrite>> {
+    let mut paths = BTreeSet::new();
+    for line in run_git_lines(
+        repo,
+        &["ls-files", "--cached", "--others", "--exclude-standard"],
+    )? {
+        paths.insert(line);
+    }
+
+    let mut writes = Vec::new();
+    for relative in paths {
+        let absolute = repo.join(&relative);
+        if !absolute.is_file() {
+            continue;
+        }
+
+        let content = std::fs::read(&absolute)
+            .with_context(|| format!("failed to read {}", absolute.display()))?;
+        let executable = is_executable(&absolute)?;
+        writes.push(FileWrite {
+            path: relative,
+            content_b64: BASE64.encode(&content),
+            executable,
+            mode: file_mode(&absolute)?,
+            checksum_sha256: Some(sha256_hex(&content)),
+            preuploaded: false,
+            preupload_existed: false,
+            preupload_skipped: false,
+        });
+    }
+
+    Ok(writes)
 }
 
 pub fn collect_repo_snapshot(repo: &Path, resolved_ref: &str) -> Result<Vec<FileWrite>> {
@@ -178,6 +215,9 @@ pub fn collect_repo_snapshot(repo: &Path, resolved_ref: &str) -> Result<Vec<File
             executable: mode == "100755",
             mode: git_mode_to_unix_mode(mode),
             checksum_sha256: Some(sha256_hex(&content)),
+            preuploaded: false,
+            preupload_existed: false,
+            preupload_skipped: false,
         });
     }
     Ok(writes)
@@ -223,6 +263,9 @@ pub fn collect_repo_changes_between_refs(
             executable: mode.as_deref() == Some("100755"),
             mode: mode.as_deref().and_then(git_mode_to_unix_mode),
             checksum_sha256: Some(sha256_hex(&content)),
+            preuploaded: false,
+            preupload_existed: false,
+            preupload_skipped: false,
         });
     }
 

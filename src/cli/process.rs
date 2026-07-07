@@ -13,7 +13,7 @@ use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
 use crate::protocol::{
     CleanupProcess, ProcessCleanupRequest, ProcessCleanupResponse, ProcessGetRequest,
     ProcessReadRequest, ProcessReadResponse, ProcessStartRequest, ProcessTerminateRequest,
-    ProcessWriteRequest, SimpleResponse,
+    ProcessWriteRequest, SimpleResponse, parse_resource_claim_specs,
 };
 
 use super::{
@@ -28,12 +28,14 @@ pub(super) async fn process_start(
     let auth = args.auth.resolve(profile)?;
     let remote_root = resolve_remote_root(args.remote_root.as_ref(), profile)?;
     let env = parse_process_env_pairs(&args.env)?;
+    let claims = parse_resource_claim_specs(&args.claims)?;
     let payload = ProcessStartRequest {
         remote_root: remote_root.display().to_string(),
         process_id: args.process_id,
         command: args.command,
         cwd: args.cwd,
         env: Some(env),
+        claims,
         timeout_seconds: args.timeout_seconds,
         output_bytes_limit: args.output_bytes_limit,
         pipe_stdin: args.pipe_stdin,
@@ -48,12 +50,14 @@ pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -
     let auth = args.auth.resolve(profile)?;
     let remote_root = resolve_remote_root(args.remote_root.as_ref(), profile)?;
     let env = parse_process_env_pairs(&args.env)?;
+    let claims = parse_resource_claim_specs(&args.claims)?;
     let start_payload = ProcessStartRequest {
         remote_root: remote_root.display().to_string(),
         process_id: args.process_id.clone(),
         command: args.command,
         cwd: args.cwd,
         env: Some(env),
+        claims,
         timeout_seconds: args.timeout_seconds,
         output_bytes_limit: args.output_bytes_limit,
         pipe_stdin: false,

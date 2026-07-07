@@ -5,6 +5,7 @@ mod mode;
 mod process;
 mod server;
 mod sync;
+mod sync_session;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,6 +30,7 @@ pub struct App {
 #[derive(Debug, Subcommand)]
 enum CommandKind {
     SyncRun(SyncRunArgs),
+    SyncInit(SyncInitArgs),
     Health(HealthArgs),
     Server(ServerArgs),
     AcceleratorStatus(AcceleratorStatusArgs),
@@ -89,6 +91,11 @@ struct SyncRunArgs {
         help = "Repeatable KEY=VALUE or KEY= pairs for the remote environment."
     )]
     env: Vec<String>,
+    #[arg(
+        long = "claim",
+        help = "Repeatable resource claim KIND:UNIT[,UNIT...]. Enforced only for command execution in shared mode."
+    )]
+    claims: Vec<String>,
     #[arg(long = "dry-run", default_value_t = false)]
     dry_run: bool,
     #[arg(long = "checksum", default_value_t = false)]
@@ -97,10 +104,44 @@ struct SyncRunArgs {
     preserve_mode: bool,
     #[arg(long = "atomic-files", default_value_t = false)]
     atomic_files: bool,
+    #[arg(
+        long = "upload-chunk-size",
+        value_name = "BYTES",
+        default_value_t = 256 * 1024,
+        help = "Chunk size used by sync-run's file-upload transport."
+    )]
+    upload_chunk_size: usize,
     #[arg(long = "include")]
     include: Vec<String>,
     #[arg(long = "exclude-from")]
     exclude_from: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SyncInitArgs {
+    #[command(flatten)]
+    auth: ClientAuthArgs,
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long = "remote-root")]
+    remote_root: Option<PathBuf>,
+    #[arg(long = "preserve-path")]
+    preserve_path: Vec<String>,
+    #[arg(long = "dry-run", default_value_t = false)]
+    dry_run: bool,
+    #[arg(long = "checksum", default_value_t = false)]
+    checksum: bool,
+    #[arg(long = "preserve-mode", default_value_t = false)]
+    preserve_mode: bool,
+    #[arg(long = "atomic-files", default_value_t = false)]
+    atomic_files: bool,
+    #[arg(
+        long = "upload-chunk-size",
+        value_name = "BYTES",
+        default_value_t = 256 * 1024,
+        help = "Chunk size used by sync-init's file-upload transport."
+    )]
+    upload_chunk_size: usize,
 }
 
 #[derive(Debug, Args)]
@@ -330,6 +371,11 @@ struct ProcessStartArgs {
         help = "Repeatable KEY=VALUE or KEY= pairs for the remote environment."
     )]
     env: Vec<String>,
+    #[arg(
+        long = "claim",
+        help = "Repeatable resource claim KIND:UNIT[,UNIT...]. Enforced only for command execution in shared mode."
+    )]
+    claims: Vec<String>,
     #[arg(long = "pipe-stdin", default_value_t = false)]
     pipe_stdin: bool,
     #[arg(
@@ -365,6 +411,11 @@ struct ProcessRunArgs {
         help = "Repeatable KEY=VALUE or KEY= pairs for the remote environment."
     )]
     env: Vec<String>,
+    #[arg(
+        long = "claim",
+        help = "Repeatable resource claim KIND:UNIT[,UNIT...]. Enforced only for command execution in shared mode."
+    )]
+    claims: Vec<String>,
     #[arg(
         long = "json",
         default_value_t = false,
@@ -612,6 +663,8 @@ struct FileUploadArgs {
     preserve_mode: bool,
     #[arg(long = "checksum", value_name = "SHA256")]
     checksum_sha256: Option<String>,
+    #[arg(long = "lock-key")]
+    lock_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -668,6 +721,7 @@ pub async fn run() -> Result<ExitCode> {
     let profile = load_client_profile(app.profile.profile.as_ref())?;
     match app.command {
         CommandKind::SyncRun(args) => sync::sync_run(args, &profile).await,
+        CommandKind::SyncInit(args) => sync::sync_init(args, &profile).await,
         CommandKind::Health(args) => health::health(args, &profile).await,
         CommandKind::Server(args) => server::server(args).await,
         CommandKind::AcceleratorStatus(args) => {

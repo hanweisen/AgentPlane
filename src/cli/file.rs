@@ -21,6 +21,7 @@ use crate::protocol::{
     FileUploadStatusRequest, FileUploadStatusResponse, FileWriteRequest, SimpleResponse,
 };
 
+use super::sync_session::{acquire_sync_session, release_sync_session};
 use super::{
     FileDeleteArgs, FileFindArgs, FileListArgs, FileReadArgs, FileStatArgs, FileUploadArgs,
     FileWaitArgs, FileWriteArgs,
@@ -190,69 +191,193 @@ pub(super) async fn file_upload(args: FileUploadArgs, profile: &ClientProfile) -
     let mode = args
         .mode
         .or_else(|| if args.preserve_mode { local_mode } else { None });
-    let init_payload = FileUploadInitRequest {
-        remote_root: remote_root.display().to_string(),
-        path: args.path,
-        total_size: local_metadata.len(),
-        chunk_size: u64::try_from(args.chunk_size).context("chunk size is too large")?,
-        executable: args.executable || local_executable,
-        create_parents: args.create_parents,
-        atomic: args.atomic,
-        mode,
-        preserve_mode: args.preserve_mode && mode.is_none(),
-        checksum_sha256: local_checksum.clone(),
-        resume: args.resume,
+    let remote_root_string = remote_root.display().to_string();
+    let sync_session = if let Some(lock_key) = args.lock_key.as_deref() {
+        Some(acquire_sync_session(&auth, &remote_root_string, Some(lock_key)).await?)
+    } else {
+        None
     };
-    let init = init_upload(&client, &auth, &init_payload).await?;
 
-    let mut file = tokio::fs::File::open(&args.from_local)
-        .await
-        .with_context(|| format!("failed to open {}", args.from_local.display()))?;
-    file.seek(std::io::SeekFrom::Start(init.received_bytes))
-        .await?;
+    let upload_result = async {
+        let init_payload = FileUploadInitRequest {
+            remote_root: remote_root_string.clone(),
+            path: args.path,
+            total_size: local_metadata.len(),
+            chunk_size: u64::try_from(args.chunk_size).context("chunk size is too large")?,
+            executable: args.executable || local_executable,
+            create_parents: args.create_parents,
+            atomic: args.atomic,
+            mode,
+            preserve_mode: args.preserve_mode && mode.is_none(),
+            checksum_sha256: local_checksum.clone(),
+            resume: args.resume,
+            sync_session_id: sync_session
+                .as_ref()
+                .map(|session| session.sync_session_id.clone()),
+            lock_token: sync_session
+                .as_ref()
+                .map(|session| session.lock_token.clone()),
+        };
+        let init = init_upload(&client, &auth, &init_payload).await?;
 
-    let mut offset = init.received_bytes;
-    let mut buffer = vec![0_u8; args.chunk_size];
-    while offset < init.total_size {
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            bail!(
-                "local file ended early for {} at offset {}",
-                args.from_local.display(),
-                offset
-            );
+        let mut file = tokio::fs::File::open(&args.from_local)
+            .await
+            .with_context(|| format!("failed to open {}", args.from_local.display()))?;
+        file.seek(std::io::SeekFrom::Start(init.received_bytes))
+            .await?;
+
+        let mut offset = init.received_bytes;
+        let mut buffer = vec![0_u8; args.chunk_size];
+        while offset < init.total_size {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                bail!(
+                    "local file ended early for {} at offset {}",
+                    args.from_local.display(),
+                    offset
+                );
+            }
+            let chunk = &buffer[..read];
+            let next_offset = offset
+                .checked_add(u64::try_from(read).context("chunk read overflow")?)
+                .ok_or_else(|| anyhow::anyhow!("upload offset overflow"))?;
+            let chunk_payload = FileUploadChunkRequest {
+                upload_id: init.upload_id.clone(),
+                offset,
+                data_b64: BASE64.encode(chunk),
+                chunk_checksum_sha256: Some(sha256_hex(chunk)),
+                sync_session_id: sync_session
+                    .as_ref()
+                    .map(|session| session.sync_session_id.clone()),
+                lock_token: sync_session
+                    .as_ref()
+                    .map(|session| session.lock_token.clone()),
+            };
+            let response =
+                upload_chunk_with_recovery(&client, &auth, &chunk_payload, next_offset).await?;
+            offset = response.received_bytes;
         }
-        let chunk = &buffer[..read];
-        let next_offset = offset
-            .checked_add(u64::try_from(read).context("chunk read overflow")?)
-            .ok_or_else(|| anyhow::anyhow!("upload offset overflow"))?;
+
+        let response = post_json_with_client(
+            &client,
+            &auth,
+            "/v1/file/upload/finish",
+            &FileUploadFinishRequest {
+                upload_id: init.upload_id,
+                sync_session_id: sync_session
+                    .as_ref()
+                    .map(|session| session.sync_session_id.clone()),
+                lock_token: sync_session
+                    .as_ref()
+                    .map(|session| session.lock_token.clone()),
+            },
+            false,
+        )
+        .await?;
+        if response.status() == StatusCode::OK {
+            let body: SimpleResponse = response.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        print_error_response(response).await
+    }
+    .await;
+
+    if let Some(session) = sync_session
+        && let Err(error) = release_sync_session(&auth, &session).await
+    {
+        eprintln!("warning: failed to release file upload lock: {error:#}");
+    }
+    upload_result
+}
+
+pub(super) struct UploadBytesOptions {
+    pub chunk_size: usize,
+    pub resume: bool,
+    pub executable: bool,
+    pub create_parents: bool,
+    pub atomic: bool,
+    pub mode: Option<u32>,
+    pub preserve_mode: bool,
+    pub checksum_sha256: String,
+    pub sync_session_id: Option<String>,
+    pub lock_token: Option<String>,
+}
+
+pub(super) async fn upload_bytes(
+    client: &reqwest::Client,
+    auth: &ResolvedClientAuth,
+    remote_root: &str,
+    path: &str,
+    content: &[u8],
+    options: &UploadBytesOptions,
+) -> Result<()> {
+    if options.chunk_size == 0 {
+        bail!("upload chunk size must be greater than zero");
+    }
+    let checksum = normalize_sha256(&options.checksum_sha256);
+    validate_sha256(&checksum)?;
+    let actual_checksum = sha256_hex(content);
+    if !actual_checksum.eq_ignore_ascii_case(&checksum) {
+        bail!("content checksum mismatch for sync upload {}", path);
+    }
+
+    let init_payload = FileUploadInitRequest {
+        remote_root: remote_root.to_string(),
+        path: path.to_string(),
+        total_size: u64::try_from(content.len()).context("upload content is too large")?,
+        chunk_size: u64::try_from(options.chunk_size).context("chunk size is too large")?,
+        executable: options.executable,
+        create_parents: options.create_parents,
+        atomic: options.atomic,
+        mode: options.mode,
+        preserve_mode: options.preserve_mode,
+        checksum_sha256: checksum,
+        resume: options.resume,
+        sync_session_id: options.sync_session_id.clone(),
+        lock_token: options.lock_token.clone(),
+    };
+    let init = init_upload(client, auth, &init_payload).await?;
+
+    let mut offset = usize::try_from(init.received_bytes).context("upload offset is too large")?;
+    while offset < content.len() {
+        let next_offset = offset.saturating_add(options.chunk_size).min(content.len());
+        let chunk = &content[offset..next_offset];
         let chunk_payload = FileUploadChunkRequest {
             upload_id: init.upload_id.clone(),
-            offset,
+            offset: u64::try_from(offset).context("upload offset is too large")?,
             data_b64: BASE64.encode(chunk),
             chunk_checksum_sha256: Some(sha256_hex(chunk)),
+            sync_session_id: options.sync_session_id.clone(),
+            lock_token: options.lock_token.clone(),
         };
-        let response =
-            upload_chunk_with_recovery(&client, &auth, &chunk_payload, next_offset).await?;
-        offset = response.received_bytes;
+        let response = upload_chunk_with_recovery(
+            client,
+            auth,
+            &chunk_payload,
+            u64::try_from(next_offset).context("upload offset is too large")?,
+        )
+        .await?;
+        offset = usize::try_from(response.received_bytes).context("upload offset is too large")?;
     }
 
     let response = post_json_with_client(
-        &client,
-        &auth,
+        client,
+        auth,
         "/v1/file/upload/finish",
         &FileUploadFinishRequest {
             upload_id: init.upload_id,
+            sync_session_id: options.sync_session_id.clone(),
+            lock_token: options.lock_token.clone(),
         },
         false,
     )
     .await?;
     if response.status() == StatusCode::OK {
-        let body: SimpleResponse = response.json().await?;
-        println!("{}", serde_json::to_string_pretty(&body)?);
-        return Ok(ExitCode::SUCCESS);
+        let _body: SimpleResponse = response.json().await?;
+        return Ok(());
     }
-    print_error_response(response).await
+    Err(anyhow::anyhow!(response.text().await?))
 }
 
 pub(super) async fn file_delete(args: FileDeleteArgs, profile: &ClientProfile) -> Result<ExitCode> {
@@ -362,6 +487,8 @@ async fn upload_chunk_with_recovery(
             auth,
             &FileUploadStatusRequest {
                 upload_id: payload.upload_id.clone(),
+                sync_session_id: payload.sync_session_id.clone(),
+                lock_token: payload.lock_token.clone(),
             },
         )
         .await;

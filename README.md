@@ -229,8 +229,32 @@ EOF
 ```
 
 Profile files are plain `KEY=VALUE` files. They are not shell scripts and are not executed.
+Profiles can also carry a stable agent identity:
+
+```text
+AP_AGENT_ID=minimax-a
+AP_AGENT_ID_FILE=/workspace/mnt/agents/minimax-a.id
+```
+
+CLI values take precedence over profile values: `--agent-id`, then `--agent-id-file`, then
+`AP_AGENT_ID`, then `AP_AGENT_ID_FILE`. Sync lock conflict messages include this identity.
 
 ## Common Workflows
+
+### Initialize A Remote Project Directory
+
+```bash
+./agentplane sync-init \
+  --repo /path/to/local/repo \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --remote-root "$AP_REMOTE_ROOT"
+```
+
+`sync-init` mirrors the current git worktree into the remote root for first-time setup. It
+includes tracked files and unignored untracked files, skips ignored files and `.git`, and
+removes remote files that are not part of the current project snapshot unless protected by
+`--preserve-path`.
 
 ### Sync Local Changes And Run A Command
 
@@ -248,6 +272,15 @@ Profile files are plain `KEY=VALUE` files. They are not shell scripts and are no
 - default worktree delta: send local changes, untracked files, and tracked deletes
 - `--ref <target>`: mirror one exact committed git ref
 - `--ref <target> --base-ref <base>`: send only committed changes between two refs
+
+File contents transferred by `sync-run` use the same chunked upload transport as
+`file-upload`. The default sync chunk is 262144 bytes; use
+`--upload-chunk-size <BYTES>` when a gateway requires a different per-request size.
+`sync-init` and `sync-run` automatically acquire a TTL-backed sync session lock for the
+remote root while transferring and applying files, so users do not pass session ids
+manually. The CLI caches the session token in the system temp directory so the same
+`--agent-id` can recover after a dropped client; other agent ids still fail fast until the
+lock is released or expires.
 
 Use `--preserve-path <path>` with `--ref` when remote cache directories should survive exact
 mirror syncs:
@@ -387,6 +420,11 @@ Upload a large local file in chunks with resume support:
   --resume
 ```
 
+Use `--lock-key <KEY>` when multiple agents may upload the same logical artifact and should
+fail fast instead of racing on the same target. If the client dies mid-upload, rerun with
+the same `--agent-id` and `--lock-key` to recover the existing upload session; a different
+agent id remains blocked.
+
 Wait for generated output:
 
 ```bash
@@ -472,6 +510,12 @@ Pass the lease headers on execution requests:
   bash -lc 'make build'
 ```
 
+When a shared-mode command should reserve a specific resource, add repeatable `--claim`
+flags such as `--claim gpu:0`, `--claim gpu:0,1`, or `--claim port:6006`. Claims are
+checked only in shared mode with an active lease. `CUDA_VISIBLE_DEVICES` remains a
+backward-compatible GPU inference path, but explicit claims cover workloads that choose
+resources internally instead of through environment variables.
+
 Renew or release the lease at task boundaries:
 
 ```bash
@@ -493,7 +537,7 @@ Renew or release the lease at task boundaries:
 | Area | Commands |
 | --- | --- |
 | Connectivity | `health` |
-| Sync | `sync-run` |
+| Sync | `sync-init`, `sync-run` |
 | Processes | `process-start`, `process-run`, `process-get`, `process-list`, `process-read`, `process-write`, `process-terminate`, `process-cleanup` |
 | Files | `file-read`, `file-stat`, `file-wait`, `file-write`, `file-upload`, `file-delete`, `file-find`, `file-list` |
 | Accelerators | `accelerator-status`, `accelerator-preflight`, `accelerator-wait-idle`, `gpu-status`, `gpu-preflight`, `gpu-wait-idle` |

@@ -26,13 +26,14 @@ pub use self::file::{
     handle_file_delete, handle_file_find, handle_file_list, handle_file_read, handle_file_stat,
     handle_file_upload_abort, handle_file_upload_chunk, handle_file_upload_finish,
     handle_file_upload_init, handle_file_upload_status, handle_file_write, handle_sync_run,
+    handle_sync_session_init, handle_sync_session_release, handle_sync_session_status,
 };
 pub use self::process::{
     handle_process_cleanup, handle_process_get, handle_process_list, handle_process_read,
     handle_process_start, handle_process_terminate, handle_process_write,
 };
 
-use self::auth::{authorized, validate_execution_lease};
+use self::auth::{authorized, validated_execution_lease};
 use self::error::{bad_request_response, unauthorized_response};
 use crate::mode::ModeRegistry;
 use crate::protocol::{
@@ -42,7 +43,8 @@ use crate::protocol::{
     LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, ModeGetRequest, ModeGetResponse,
     ModeSwitchRequest, ModeSwitchResponse, ProcessCleanupRequest, ProcessGetRequest,
     ProcessReadRequest, ProcessStartRequest, ProcessTerminateRequest, ProcessWriteRequest,
-    SimpleResponse, SyncPayload,
+    SimpleResponse, SyncPayload, SyncSessionInitRequest, SyncSessionReleaseRequest,
+    SyncSessionStatusRequest,
 };
 
 const DEFAULT_PROCESS_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
@@ -119,6 +121,7 @@ pub struct ServerState {
     processes: Arc<Mutex<BTreeMap<String, process::ManagedProcess>>>,
     modes: Arc<Mutex<ModeRegistry>>,
     uploads: Arc<Mutex<BTreeMap<String, file::UploadSession>>>,
+    sync_sessions: Arc<Mutex<BTreeMap<String, file::SyncSession>>>,
 }
 
 impl ServerState {
@@ -139,6 +142,7 @@ impl ServerState {
             processes: Arc::new(Mutex::new(BTreeMap::new())),
             modes: Arc::new(Mutex::new(ModeRegistry::default())),
             uploads: Arc::new(Mutex::new(BTreeMap::new())),
+            sync_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -209,6 +213,9 @@ pub async fn serve_with_config_and_accelerators(
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/sync-run", post(sync_run))
+        .route("/v1/sync/session/init", post(sync_session_init))
+        .route("/v1/sync/session/status", post(sync_session_status))
+        .route("/v1/sync/session/release", post(sync_session_release))
         .route("/v1/mode/get", post(mode_get))
         .route("/v1/mode/switch", post(mode_switch))
         .route("/v1/lease/renew", post(lease_renew))
@@ -307,13 +314,58 @@ async fn sync_run(
     if !authorized(&headers, &state.token) {
         return unauthorized_response().into_response();
     }
-    if payload.command.is_some()
-        && let Err(error) = validate_execution_lease(&state, &headers).await
-    {
-        return bad_request_response(error).into_response();
-    }
+    let execution_lease = if payload.command.is_some() {
+        match validated_execution_lease(&state, &headers).await {
+            Ok(execution_lease) => execution_lease,
+            Err(error) => return bad_request_response(error).into_response(),
+        }
+    } else {
+        None
+    };
 
-    match file::handle_sync_run(&state, payload).await {
+    match file::handle_sync_run_with_lease(&state, payload, execution_lease.as_ref()).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn sync_session_init(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<SyncSessionInitRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    match file::handle_sync_session_init(&state, payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn sync_session_status(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<SyncSessionStatusRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    match file::handle_sync_session_status(&state, payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn sync_session_release(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<SyncSessionReleaseRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    match file::handle_sync_session_release(&state, payload).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => bad_request_response(error).into_response(),
     }
@@ -397,10 +449,12 @@ async fn process_start(
     if !authorized(&headers, &state.token) {
         return unauthorized_response().into_response();
     }
-    if let Err(error) = validate_execution_lease(&state, &headers).await {
-        return bad_request_response(error).into_response();
-    }
-    match process::handle_process_start(&state, payload).await {
+    let execution_lease = match validated_execution_lease(&state, &headers).await {
+        Ok(execution_lease) => execution_lease,
+        Err(error) => return bad_request_response(error).into_response(),
+    };
+    match process::handle_process_start_with_lease(&state, payload, execution_lease.as_ref()).await
+    {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => bad_request_response(error).into_response(),
     }

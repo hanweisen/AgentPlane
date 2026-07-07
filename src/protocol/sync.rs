@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::FileWrite;
+use super::ResourceClaim;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -21,11 +22,17 @@ pub struct SyncPayload {
     pub timeout_seconds: u64,
     pub env: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
+    pub claims: Vec<ResourceClaim>,
+    #[serde(default)]
     pub checksum: bool,
     #[serde(default)]
     pub preserve_mode: bool,
     #[serde(default)]
     pub atomic_files: bool,
+    #[serde(default)]
+    pub sync_session_id: Option<String>,
+    #[serde(default)]
+    pub lock_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +63,44 @@ pub struct SyncReport {
     pub skipped: Vec<String>,
     pub deleted: Vec<String>,
     pub conflict: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncSessionInitRequest {
+    pub remote_root: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub lock_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncSessionInitResponse {
+    pub ok: bool,
+    pub sync_session_id: String,
+    pub lock_token: String,
+    pub agent_id: String,
+    pub remote_root: String,
+    pub lock_key: String,
+    pub expires_unix_ms: u128,
+    pub heartbeat_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncSessionStatusRequest {
+    pub sync_session_id: String,
+    pub lock_token: String,
+    pub remote_root: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub lock_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncSessionReleaseRequest {
+    pub sync_session_id: String,
+    pub lock_token: String,
 }
 
 pub(crate) fn relative_path_matches_preserve_path(

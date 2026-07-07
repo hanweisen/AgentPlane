@@ -18,8 +18,10 @@ use crate::protocol::{
     CleanupProcess, ProcessCleanupRequest, ProcessCleanupResponse, ProcessGetRequest,
     ProcessGetResponse, ProcessInfo, ProcessListResponse, ProcessOutputChunk, ProcessOutputStream,
     ProcessReadRequest, ProcessReadResponse, ProcessStartConfig, ProcessStartRequest,
-    ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest, SimpleResponse,
+    ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest, ResourceClaim,
+    SimpleResponse, infer_gpu_resource_claims_from_process_env, merge_resource_claims,
 };
+use crate::server::auth::ExecutionLease;
 
 const MAX_PROCESS_READ_WAIT_MS: u64 = 30_000;
 const MAINTENANCE_INTERVAL_MS: u64 = 1000;
@@ -56,6 +58,7 @@ struct ProcessOutputState {
 
 #[derive(Debug)]
 pub(super) struct ManagedProcess {
+    process_id: String,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     output: Arc<Mutex<ProcessOutputState>>,
@@ -69,6 +72,7 @@ pub(super) struct ManagedProcess {
     started_at_unix_ms: u128,
     timeout_seconds: Option<u64>,
     output_bytes_limit: usize,
+    claimed_resources: Vec<ResourceClaim>,
     exit_code: Option<i32>,
     failure: Option<String>,
     finished_at: Option<Instant>,
@@ -81,6 +85,7 @@ impl ManagedProcess {
             &self.remote_root,
             &self.cwd,
             &self.command,
+            &self.claimed_resources,
             self.pipe_stdin,
             self.kill_tree_on_terminate,
             self.timeout_seconds,
@@ -226,6 +231,14 @@ pub async fn handle_process_start(
     state: &ServerState,
     payload: ProcessStartRequest,
 ) -> Result<ProcessStartResponse> {
+    handle_process_start_with_lease(state, payload, None).await
+}
+
+pub(super) async fn handle_process_start_with_lease(
+    state: &ServerState,
+    payload: ProcessStartRequest,
+    execution_lease: Option<&ExecutionLease>,
+) -> Result<ProcessStartResponse> {
     if payload.command.is_empty() {
         bail!("command must not be empty");
     }
@@ -256,15 +269,36 @@ pub async fn handle_process_start(
         .min(state.limits.max_process_output_limit_bytes);
     let requested_kill_tree_on_terminate =
         payload.kill_tree_on_terminate || state.limits.default_kill_tree_on_terminate;
+    let requested_claims = if execution_lease.is_some() {
+        merge_resource_claims(
+            &payload.claims,
+            &infer_gpu_resource_claims_from_process_env(payload.env.as_ref()),
+        )?
+    } else {
+        Vec::new()
+    };
     if let Some(existing) = processes.get_mut(&payload.process_id) {
-        refresh_process_state(existing).await?;
+        refresh_process_state(state, existing).await?;
         if payload.matches_existing_normalized_config(
             &existing.start_config(),
             &requested_remote_root,
             &requested_cwd,
+            &requested_claims,
             requested_output_limit,
             requested_kill_tree_on_terminate,
         ) {
+            if let Some(execution_lease) = execution_lease
+                && !requested_claims.is_empty()
+                && process_still_holds_runtime(existing)
+            {
+                let mut modes = state.modes.lock().await;
+                modes.claim_resources(
+                    &execution_lease.task_id,
+                    &execution_lease.lease_id,
+                    &payload.process_id,
+                    &requested_claims,
+                )?;
+            }
             return Ok(ProcessStartResponse {
                 ok: true,
                 process_id: payload.process_id,
@@ -278,6 +312,18 @@ pub async fn handle_process_start(
         );
     }
     enforce_process_capacity(&processes, &state.limits)?;
+    let reserved_resource_claims = if let Some(execution_lease) = execution_lease {
+        let mut modes = state.modes.lock().await;
+        modes.claim_resources(
+            &execution_lease.task_id,
+            &execution_lease.lease_id,
+            &payload.process_id,
+            &requested_claims,
+        )?;
+        !requested_claims.is_empty()
+    } else {
+        false
+    };
 
     let mut command = Command::new(&payload.command[0]);
     if payload.command.len() > 1 {
@@ -304,7 +350,16 @@ pub async fn handle_process_start(
         }
     }
 
-    let mut child = command.spawn().context("failed to spawn process")?;
+    let mut child = match command.spawn().context("failed to spawn process") {
+        Ok(child) => child,
+        Err(error) => {
+            if reserved_resource_claims {
+                let mut modes = state.modes.lock().await;
+                modes.release_process_resource_claims(&payload.process_id);
+            }
+            return Err(error);
+        }
+    };
     let process_group_id = process_group_id(&child, requested_kill_tree_on_terminate);
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
@@ -338,6 +393,7 @@ pub async fn handle_process_start(
     processes.insert(
         payload.process_id.clone(),
         ManagedProcess {
+            process_id: payload.process_id.clone(),
             child: Some(child),
             stdin,
             output,
@@ -351,6 +407,7 @@ pub async fn handle_process_start(
             started_at_unix_ms: unix_now_ms(),
             timeout_seconds: payload.timeout_seconds,
             output_bytes_limit: output_limit,
+            claimed_resources: requested_claims,
             exit_code: None,
             failure: None,
             finished_at: None,
@@ -424,7 +481,7 @@ pub async fn handle_process_write(
     let process = processes
         .get_mut(&payload.process_id)
         .ok_or_else(|| anyhow!("unknown process_id: {}", payload.process_id))?;
-    refresh_process_state(process).await?;
+    refresh_process_state(state, process).await?;
     if process.exit_code.is_some() {
         bail!(
             "process already exited for process_id: {}",
@@ -467,7 +524,7 @@ pub async fn handle_process_terminate(
     let process = processes
         .get_mut(&payload.process_id)
         .ok_or_else(|| anyhow!("unknown process_id: {}", payload.process_id))?;
-    refresh_process_state(process).await?;
+    refresh_process_state(state, process).await?;
     if process.exit_code.is_some() {
         if payload.tree || process.kill_tree_on_terminate {
             terminate_process(process, true).await;
@@ -478,7 +535,13 @@ pub async fn handle_process_terminate(
         });
     }
     terminate_process(process, payload.tree).await;
-    mark_process_finished(process, 1, Some("process terminated by client".to_string()));
+    finish_process(
+        state,
+        process,
+        1,
+        Some("process terminated by client".to_string()),
+    )
+    .await;
     Ok(SimpleResponse {
         ok: true,
         error: None,
@@ -569,7 +632,7 @@ async fn read_process_snapshot(
         let process = processes
             .get_mut(process_id)
             .ok_or_else(|| anyhow!("unknown process_id: {process_id}"))?;
-        refresh_process_state(process).await?;
+        refresh_process_state(state, process).await?;
         (
             Arc::clone(&process.output),
             process.exit_code,
@@ -653,7 +716,7 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
         let process = processes
             .get_mut(process_id)
             .ok_or_else(|| anyhow!("unknown process_id: {process_id}"))?;
-        refresh_process_state(process).await?;
+        refresh_process_state(state, process).await?;
         (
             process.remote_root.clone(),
             process.cwd.clone(),
@@ -708,14 +771,15 @@ pub(super) fn spawn_maintenance_task(state: Arc<ServerState>) {
             let mut processes = state.processes.lock().await;
             prune_finished_processes(&mut processes, &state.limits);
             for process in processes.values_mut() {
-                let _ = refresh_process_state(process).await;
+                let _ = refresh_process_state(&state, process).await;
             }
         }
     });
 }
 
-async fn refresh_process_state(process: &mut ManagedProcess) -> Result<()> {
+async fn refresh_process_state(state: &ServerState, process: &mut ManagedProcess) -> Result<()> {
     if process.exit_code.is_some() {
+        maybe_release_process_resource_claims(state, process).await;
         process.child = None;
         process.stdin = None;
         return Ok(());
@@ -725,25 +789,29 @@ async fn refresh_process_state(process: &mut ManagedProcess) -> Result<()> {
         && process.started_at.elapsed() >= Duration::from_secs(timeout_seconds)
     {
         terminate_process(process, process.kill_tree_on_terminate).await;
-        mark_process_finished(
+        finish_process(
+            state,
             process,
             124,
             Some(format!("process timed out after {timeout_seconds} seconds")),
-        );
+        )
+        .await;
         return Ok(());
     }
 
     let Some(child) = process.child.as_mut() else {
-        mark_process_finished(
+        finish_process(
+            state,
             process,
             1,
             Some("process state lost child handle unexpectedly".to_string()),
-        );
+        )
+        .await;
         return Ok(());
     };
 
     if let Some(status) = child.try_wait().context("failed to poll child status")? {
-        mark_process_finished(process, status.code().unwrap_or(1), None);
+        finish_process(state, process, status.code().unwrap_or(1), None).await;
     }
     Ok(())
 }
@@ -832,6 +900,10 @@ fn process_children_running(process: &ManagedProcess) -> bool {
     process.process_group_id.is_some_and(process_group_alive)
 }
 
+fn process_still_holds_runtime(process: &ManagedProcess) -> bool {
+    process.exit_code.is_none() || process_children_running(process)
+}
+
 #[cfg(unix)]
 fn process_group_alive(process_group_id: i32) -> bool {
     if process_group_id <= 0 {
@@ -857,6 +929,35 @@ fn mark_process_finished(process: &mut ManagedProcess, exit_code: i32, failure: 
     process.finished_at_unix_ms = Some(unix_now_ms());
     process.child = None;
     process.stdin = None;
+}
+
+async fn finish_process(
+    state: &ServerState,
+    process: &mut ManagedProcess,
+    exit_code: i32,
+    failure: Option<String>,
+) {
+    mark_process_finished(process, exit_code, failure);
+    maybe_release_process_resource_claims(state, process).await;
+}
+
+async fn release_process_resource_claims(state: &ServerState, process: &mut ManagedProcess) {
+    if process.claimed_resources.is_empty() {
+        return;
+    }
+    let mut modes = state.modes.lock().await;
+    modes.release_process_resource_claims(&process.process_id);
+    process.claimed_resources.clear();
+}
+
+async fn maybe_release_process_resource_claims(state: &ServerState, process: &mut ManagedProcess) {
+    if process.claimed_resources.is_empty() {
+        return;
+    }
+    if process.exit_code.is_some() && process_children_running(process) {
+        return;
+    }
+    release_process_resource_claims(state, process).await;
 }
 
 fn prune_finished_processes(

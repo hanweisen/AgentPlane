@@ -78,6 +78,17 @@ The profile parser accepts simple `KEY=VALUE` lines only and does not execute sh
 Command-line values still override profile values. Treat profile files as secrets and do not
 write them into project source directories.
 
+Profiles may also contain a stable agent identity:
+
+```text
+AP_AGENT_ID=minimax-a
+AP_AGENT_ID_FILE=/workspace/mnt/agents/minimax-a.id
+```
+
+CLI precedence is `--agent-id`, `--agent-id-file`, `AP_AGENT_ID`, then
+`AP_AGENT_ID_FILE`. Use per-agent identity files for long multi-agent jobs so context
+compaction does not make an agent forget its lock/claim identity.
+
 Local direct-server E2E verification has covered this profile flow with `health`,
 `process-list`, `file-write`, `file-list`, `file-read`, and `process-run`, including remote
 exit-code propagation. Gateway header mapping from profile variables is covered by the CLI
@@ -480,14 +491,21 @@ generic accelerator form. If `gpu-status` has already returned `available:false`
 same container session, do not call these GPU readiness helpers unless the user says the
 environment changed.
 
-### Shared mode and GPU leases
+### Shared mode and lease-backed resource claims
 
 Default mode is **single-agent**. Do not enable shared mode unless the user says multiple
-agents or shared GPU resources are involved.
+agents or shared resources are involved.
 
 In shared mode, command execution requires an active task lease. File-only operations still
 work normally, but `process-start` and `sync-run --command ...` must include the lease
 headers.
+
+When a task must reserve a resource under shared mode, prefer explicit claims on the
+execution request, for example `--claim gpu:0`, `--claim gpu:0,1`, or `--claim port:6006`.
+Claims are enforced only while the lease stays active. Legacy GPU workflows that only set
+`CUDA_VISIBLE_DEVICES` still participate in GPU protection, but explicit claims are the
+correct path for workloads that pick resources internally instead of via environment
+variables.
 
 Acquire or recover a lease:
 
@@ -561,7 +579,12 @@ Example shared `process-start`:
 
 ### Sync modes
 
-`sync-run` now has two distinct operating modes. Choose deliberately:
+Use `sync-init` for first-time remote directory initialization from the current git
+worktree. It mirrors tracked files plus unignored untracked files into `AP_REMOTE_ROOT`,
+skips ignored files and `.git`, deletes remote files outside that project snapshot, and
+uses the same chunked upload transport as `file-upload`.
+
+`sync-run` now has three distinct source modes. Choose deliberately:
 
 - default mode without `--ref`
   sync the local repo's current git delta: tracked edits, staged edits, untracked files, and tracked deletes
@@ -602,6 +625,18 @@ Use `--ref <target> --base-ref <base>` when:
 - only changed files in `base..target` are uploaded
 - tracked deletes in `base..target` are sent explicitly
 - the request body is usually much smaller than full `--ref` snapshot sync
+
+`sync-run` transfers file contents through the same chunked upload protocol as
+`file-upload` before sending the final sync metadata and optional command. The default
+sync upload chunk is 262144 bytes; pass `--upload-chunk-size <BYTES>` when a gateway needs
+a smaller or larger per-request payload.
+
+`sync-init` and `sync-run` automatically acquire a TTL-backed sync session lock for the
+canonical remote root. The CLI owns `sync_session_id` and `lock_token`; users do not pass
+them manually. Lock conflicts fail fast and include the owning agent id, session id, lock
+key, and expiry time. The CLI caches the session token in the system temp directory, and
+the server also lets the same `agent_id` recover the same lock if the client died before
+the cache was published. Different agent ids remain blocked until release or TTL expiry.
 
 ### Exact mirror and preserve paths
 
@@ -824,6 +859,9 @@ Operate defensively:
 - keep each single request and response comfortably below 10 MB
 - do not send large inline file payloads through one `file-write`
 - prefer `file-upload --chunk-size <BYTES> --resume` for large local files
+- add `file-upload --lock-key <KEY>` when multiple agents may upload the same logical artifact;
+  rerun with the same `--agent-id` and `--lock-key` to recover a killed upload client
+- use `sync-run --upload-chunk-size <BYTES>` when sync writes need a smaller gateway-safe chunk
 - do not ask for huge log reads in one `process-read`
 - do not assume gzip will save an oversized response enough to be safe
 
@@ -1065,7 +1103,7 @@ This is independent from the local shell proxy issue.
 6. Confirm basic read access with `process-list` or `file-list`
 7. Prefer local edits as the source of truth
 8. Before GPU-specific work, call `accelerator-status --kind gpu` or `gpu-status` once to establish availability; if it returns `available:false`, do not repeat GPU probes unless the user says the environment changed. If GPUs are available, use `gpu-preflight` before launch and `gpu-wait-idle` after teardown instead of hand-written JSON polling
-9. Use default `sync-run` for git-delta loops, `sync-run --ref` for exact committed snapshots, and `sync-run --ref ... --base-ref ...` for low-payload committed deltas on known remote baselines
+9. Use `sync-init` for first-time remote directory setup, default `sync-run` for git-delta loops, `sync-run --ref` for exact committed snapshots, and `sync-run --ref ... --base-ref ...` for low-payload committed deltas on known remote baselines
 10. Use file and process APIs for targeted remote manipulation
 11. For long jobs, manage them as reconnect-safe sessions and renew shared-mode leases
 12. For orphan cleanup, run `process-cleanup --dry-run --text` first and send `--kill --signal TERM` only after reviewing matched PIDs

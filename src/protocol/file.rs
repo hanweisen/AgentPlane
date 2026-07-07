@@ -9,6 +9,12 @@ pub struct FileWrite {
     pub mode: Option<u32>,
     #[serde(default)]
     pub checksum_sha256: Option<String>,
+    #[serde(default)]
+    pub preuploaded: bool,
+    #[serde(default)]
+    pub preupload_existed: bool,
+    #[serde(default)]
+    pub preupload_skipped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +89,10 @@ pub struct FileUploadInitRequest {
     pub checksum_sha256: String,
     #[serde(default)]
     pub resume: bool,
+    #[serde(default)]
+    pub sync_session_id: Option<String>,
+    #[serde(default)]
+    pub lock_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +111,10 @@ pub struct FileUploadChunkRequest {
     pub data_b64: String,
     #[serde(default)]
     pub chunk_checksum_sha256: Option<String>,
+    #[serde(default)]
+    pub sync_session_id: Option<String>,
+    #[serde(default)]
+    pub lock_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +127,10 @@ pub struct FileUploadChunkResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileUploadStatusRequest {
     pub upload_id: String,
+    #[serde(default)]
+    pub sync_session_id: Option<String>,
+    #[serde(default)]
+    pub lock_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,11 +145,19 @@ pub struct FileUploadStatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileUploadFinishRequest {
     pub upload_id: String,
+    #[serde(default)]
+    pub sync_session_id: Option<String>,
+    #[serde(default)]
+    pub lock_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileUploadAbortRequest {
     pub upload_id: String,
+    #[serde(default)]
+    pub sync_session_id: Option<String>,
+    #[serde(default)]
+    pub lock_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

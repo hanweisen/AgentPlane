@@ -50,6 +50,10 @@ pub(crate) struct ClientAuthArgs {
         help = "Repeatable raw HTTP header like 'Name: value' added to every request."
     )]
     header: Vec<String>,
+    #[arg(long = "agent-id")]
+    agent_id: Option<String>,
+    #[arg(long = "agent-id-file", value_name = "PATH")]
+    agent_id_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,6 +65,8 @@ pub(crate) struct ClientProfile {
     pub(crate) headers: Vec<String>,
     pub(crate) connect_retries: Option<usize>,
     pub(crate) connect_retry_delay_ms: Option<u64>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) agent_id_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +80,7 @@ pub(crate) struct ResolvedClientAuth {
     pub(crate) tls_ca_cert: Option<PathBuf>,
     pub(crate) tls_insecure_skip_verify: bool,
     pub(crate) header: Vec<String>,
+    pub(crate) agent_id: String,
 }
 
 impl ClientAuthArgs {
@@ -90,6 +97,12 @@ impl ClientAuthArgs {
             .ok_or_else(|| anyhow!("--token is required unless AP_TOKEN is set in --profile"))?;
         let mut header = profile.headers.clone();
         header.extend(self.header.clone());
+        let agent_id = resolve_agent_id(
+            self.agent_id.as_deref(),
+            self.agent_id_file.as_ref(),
+            profile.agent_id.as_deref(),
+            profile.agent_id_file.as_ref(),
+        )?;
         Ok(ResolvedClientAuth {
             server,
             token,
@@ -111,6 +124,7 @@ impl ClientAuthArgs {
             tls_ca_cert: self.tls_ca_cert.clone(),
             tls_insecure_skip_verify: self.tls_insecure_skip_verify,
             header,
+            agent_id,
         })
     }
 }
@@ -128,6 +142,8 @@ pub(crate) fn load_client_profile(path: Option<&PathBuf>) -> Result<ClientProfil
         token: values.get("AP_TOKEN").cloned(),
         remote_root: values.get("AP_REMOTE_ROOT").map(PathBuf::from),
         socks5_hostname: values.get("AP_SOCKS5_HOSTNAME").cloned(),
+        agent_id: values.get("AP_AGENT_ID").cloned(),
+        agent_id_file: values.get("AP_AGENT_ID_FILE").map(PathBuf::from),
         ..ClientProfile::default()
     };
     profile.headers.extend(profile_headers(&values));
@@ -146,6 +162,41 @@ pub(crate) fn load_client_profile(path: Option<&PathBuf>) -> Result<ClientProfil
         );
     }
     Ok(profile)
+}
+
+fn resolve_agent_id(
+    cli_agent_id: Option<&str>,
+    cli_agent_id_file: Option<&PathBuf>,
+    profile_agent_id: Option<&str>,
+    profile_agent_id_file: Option<&PathBuf>,
+) -> Result<String> {
+    if let Some(agent_id) = cli_agent_id {
+        return normalize_agent_id(agent_id);
+    }
+    if let Some(path) = cli_agent_id_file {
+        return read_agent_id_file(path);
+    }
+    if let Some(agent_id) = profile_agent_id {
+        return normalize_agent_id(agent_id);
+    }
+    if let Some(path) = profile_agent_id_file {
+        return read_agent_id_file(path);
+    }
+    Ok(format!("agentplane-{}", std::process::id()))
+}
+
+fn read_agent_id_file(path: &PathBuf) -> Result<String> {
+    let value = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read agent id file {}", path.display()))?;
+    normalize_agent_id(value.trim())
+}
+
+fn normalize_agent_id(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("agent id must not be empty"));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn profile_headers(values: &BTreeMap<String, String>) -> Vec<String> {
@@ -236,6 +287,39 @@ mod tests {
         let profile = load_client_profile(Some(&path))?;
         assert_eq!(profile.server.as_deref(), Some("http://example.test"));
         assert_eq!(profile.socks5_hostname.as_deref(), Some("127.0.0.1:1086"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_client_profile_reads_agent_id_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let agent_id_path = dir.path().join("agent.id");
+        std::fs::write(&agent_id_path, "minimax-a\n")?;
+        let profile_path = dir.path().join("agentplane.env");
+        std::fs::write(
+            &profile_path,
+            format!(
+                "AP_SERVER=http://example.test\nAP_TOKEN=test-token\nAP_AGENT_ID_FILE={}\n",
+                agent_id_path.display()
+            ),
+        )?;
+
+        let profile = load_client_profile(Some(&profile_path))?;
+        let auth = ClientAuthArgs {
+            server: None,
+            token: None,
+            socks5_hostname: None,
+            request_timeout_seconds: None,
+            connect_retries: None,
+            connect_retry_delay_ms: None,
+            tls_ca_cert: None,
+            tls_insecure_skip_verify: false,
+            header: Vec::new(),
+            agent_id: None,
+            agent_id_file: None,
+        }
+        .resolve(&profile)?;
+        assert_eq!(auth.agent_id, "minimax-a");
         Ok(())
     }
 }

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::ResourceClaim;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessStartRequest {
     pub remote_root: String,
@@ -7,6 +9,8 @@ pub struct ProcessStartRequest {
     pub command: Vec<String>,
     pub cwd: Option<String>,
     pub env: Option<std::collections::BTreeMap<String, Option<String>>>,
+    #[serde(default)]
+    pub claims: Vec<ResourceClaim>,
     pub timeout_seconds: Option<u64>,
     pub output_bytes_limit: Option<usize>,
     pub pipe_stdin: bool,
@@ -19,6 +23,7 @@ pub(crate) struct ProcessStartConfig<'a> {
     remote_root: &'a str,
     cwd: &'a str,
     command: &'a [String],
+    claims: &'a [ResourceClaim],
     pipe_stdin: bool,
     kill_tree_on_terminate: bool,
     timeout_seconds: Option<u64>,
@@ -30,6 +35,7 @@ impl<'a> ProcessStartConfig<'a> {
         remote_root: &'a str,
         cwd: &'a str,
         command: &'a [String],
+        claims: &'a [ResourceClaim],
         pipe_stdin: bool,
         kill_tree_on_terminate: bool,
         timeout_seconds: Option<u64>,
@@ -39,6 +45,7 @@ impl<'a> ProcessStartConfig<'a> {
             remote_root,
             cwd,
             command,
+            claims,
             pipe_stdin,
             kill_tree_on_terminate,
             timeout_seconds,
@@ -53,12 +60,14 @@ impl ProcessStartRequest {
         existing: &ProcessStartConfig<'_>,
         remote_root: &str,
         cwd: &str,
+        claims: &[ResourceClaim],
         output_bytes_limit: usize,
         kill_tree_on_terminate: bool,
     ) -> bool {
         existing.remote_root == remote_root
             && existing.cwd == cwd
             && existing.command == self.command.as_slice()
+            && existing.claims == claims
             && existing.pipe_stdin == self.pipe_stdin
             && existing.kill_tree_on_terminate == kill_tree_on_terminate
             && existing.timeout_seconds == self.timeout_seconds
