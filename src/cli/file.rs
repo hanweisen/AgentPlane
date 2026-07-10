@@ -13,7 +13,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::cli_client::{
     build_http_client, post_json, post_json_with_client, print_error_response,
 };
-use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
+use crate::config::{
+    ClientProfile, ResolvedClientAuth, load_client_profile, resolve_profile_auth,
+    resolve_remote_root,
+};
 use crate::protocol::{
     FileDeleteRequest, FileFindRequest, FileListRequest, FileReadRequest, FileReadResponse,
     FileStatRequest, FileStatResponse, FileUploadChunkRequest, FileUploadChunkResponse,
@@ -23,8 +26,8 @@ use crate::protocol::{
 
 use super::sync_session::{acquire_sync_session, release_sync_session};
 use super::{
-    FileDeleteArgs, FileFindArgs, FileListArgs, FileReadArgs, FileStatArgs, FileUploadArgs,
-    FileWaitArgs, FileWriteArgs,
+    FileCopyArgs, FileDeleteArgs, FileFindArgs, FileListArgs, FileReadArgs, FileStatArgs,
+    FileUploadArgs, FileWaitArgs, FileWriteArgs,
 };
 
 const FILE_WAIT_POLL_MS: u64 = 100;
@@ -289,6 +292,106 @@ pub(super) async fn file_upload(args: FileUploadArgs, profile: &ClientProfile) -
         eprintln!("warning: failed to release file upload lock: {error:#}");
     }
     upload_result
+}
+
+pub(super) async fn file_copy(args: FileCopyArgs, _profile: &ClientProfile) -> Result<ExitCode> {
+    if args.chunk_size == 0 {
+        bail!("--chunk-size must be greater than zero");
+    }
+    let from_profile = load_client_profile(Some(&args.from_profile))?;
+    let to_profile = load_client_profile(Some(&args.to_profile))?;
+    let from_auth = resolve_profile_auth(&from_profile)?;
+    let to_auth = resolve_profile_auth(&to_profile)?;
+    let from_root = resolve_remote_root(args.from_remote_root.as_ref(), &from_profile)?;
+    let to_root = resolve_remote_root(args.to_remote_root.as_ref(), &to_profile)?;
+    let from_root_string = from_root.display().to_string();
+    let to_root_string = to_root.display().to_string();
+
+    // Pull the source file. file-read returns the whole file base64-encoded in
+    // one response, so very large sources are bounded by that transport; the
+    // destination side still uploads in chunks to stay friendly to gateways.
+    let from_client = build_http_client(&from_auth)?;
+    let read_payload = FileReadRequest {
+        remote_root: from_root_string,
+        path: args.from_path.clone(),
+    };
+    let read_response = post_json_with_client(
+        &from_client,
+        &from_auth,
+        "/v1/file/read",
+        &read_payload,
+        true,
+    )
+    .await?;
+    if read_response.status() != StatusCode::OK {
+        return print_error_response(read_response).await;
+    }
+    let read_body: FileReadResponse = read_response.json().await?;
+    let bytes = BASE64
+        .decode(read_body.content_b64.as_bytes())
+        .context("failed to decode source file content")?;
+    let source_checksum = sha256_hex(&bytes);
+
+    // Push to the destination through the existing chunked upload transport.
+    // upload_bytes verifies the content checksum before the first chunk, so the
+    // transfer itself is integrity-checked; create_parents lets the to-path
+    // land in a directory that does not exist yet.
+    let to_client = build_http_client(&to_auth)?;
+    let options = UploadBytesOptions {
+        chunk_size: args.chunk_size,
+        resume: false,
+        executable: false,
+        create_parents: true,
+        atomic: args.atomic,
+        mode: None,
+        preserve_mode: false,
+        checksum_sha256: source_checksum.clone(),
+        sync_session_id: None,
+        lock_token: None,
+    };
+    upload_bytes(
+        &to_client,
+        &to_auth,
+        &to_root_string,
+        &args.to_path,
+        &bytes,
+        &options,
+    )
+    .await?;
+
+    let mut summary = serde_json::json!({
+        "ok": true,
+        "from_path": args.from_path,
+        "to_path": args.to_path,
+        "bytes": bytes.len(),
+        "sha256": source_checksum,
+    });
+
+    if args.checksum {
+        let stat_payload = FileStatRequest {
+            remote_root: to_root_string,
+            path: args.to_path.clone(),
+        };
+        match read_file_stat(&to_auth, &stat_payload).await? {
+            Ok(stat) => {
+                let verified = stat
+                    .sha256
+                    .as_deref()
+                    .map(|sha| sha.eq_ignore_ascii_case(&source_checksum))
+                    .unwrap_or(false);
+                summary["checksum_verified"] = serde_json::json!(verified);
+                if !verified {
+                    summary["ok"] = serde_json::json!(false);
+                    eprintln!("{}", serde_json::to_string_pretty(&summary)?);
+                    return Ok(ExitCode::from(1));
+                }
+            }
+            Err(response) => return print_error_response(response).await,
+        }
+    }
+
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(ExitCode::SUCCESS)
 }
 
 pub(super) struct UploadBytesOptions {

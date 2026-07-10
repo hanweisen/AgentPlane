@@ -252,6 +252,26 @@ pub(crate) fn resolve_remote_root(
         })
 }
 
+/// Resolve client auth using only values from a profile file, with no CLI
+/// overrides. Used by commands such as `file-copy` that drive two independent
+/// profiles and therefore cannot take a single set of `--server`/`--token` args.
+pub(crate) fn resolve_profile_auth(profile: &ClientProfile) -> Result<ResolvedClientAuth> {
+    ClientAuthArgs {
+        server: None,
+        token: None,
+        socks5_hostname: None,
+        request_timeout_seconds: None,
+        connect_retries: None,
+        connect_retry_delay_ms: None,
+        tls_ca_cert: None,
+        tls_insecure_skip_verify: false,
+        header: Vec::new(),
+        agent_id: None,
+        agent_id_file: None,
+    }
+    .resolve(profile)
+}
+
 pub(crate) fn parse_octal_mode(value: &str) -> std::result::Result<u32, String> {
     let trimmed = value.trim_start_matches("0o");
     if trimmed.is_empty() || trimmed.len() > 4 {

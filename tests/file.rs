@@ -1167,3 +1167,243 @@ fn cli_file_upload_default_chunk_size_handles_large_file() -> Result<()> {
 
     Ok(())
 }
+
+fn write_profile(
+    path: &std::path::Path,
+    server: &str,
+    token: &str,
+    remote_root: &std::path::Path,
+) -> Result<()> {
+    std::fs::write(
+        path,
+        format!(
+            "AP_SERVER={server}\nAP_TOKEN={token}\nAP_REMOTE_ROOT={root}\n",
+            root = remote_root.display()
+        ),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn cli_file_copy_transfers_text_and_binary_across_profiles() -> Result<()> {
+    let token = "test-token";
+    let root_a = tempfile::tempdir()?;
+    let root_b = tempfile::tempdir()?;
+    let profiles = tempfile::tempdir()?;
+    let harness_a = CliServerHarness::start(root_a.path(), token)?;
+    let harness_b = CliServerHarness::start(root_b.path(), token)?;
+
+    let profile_a = profiles.path().join("node-a.env");
+    let profile_b = profiles.path().join("node-b.env");
+    write_profile(&profile_a, &harness_a.base_url, token, root_a.path())?;
+    write_profile(&profile_b, &harness_b.base_url, token, root_b.path())?;
+
+    let write_text = run_cli(&[
+        "file-write",
+        "--server",
+        &harness_a.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &root_a.path().display().to_string(),
+        "--path",
+        "data/text.txt",
+        "--content",
+        "hello node-b\n",
+    ])?;
+    assert!(write_text.status.success());
+
+    let blob = b"\x00\x01\x02\xff binary \xfe\xfd payload\n";
+    let local_blob = profiles.path().join("blob.bin");
+    std::fs::write(&local_blob, blob)?;
+    let blob_sha = test_sha256_hex(blob);
+    let write_blob = run_cli(&[
+        "file-write",
+        "--server",
+        &harness_a.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &root_a.path().display().to_string(),
+        "--path",
+        "data/blob.bin",
+        "--from-local",
+        &local_blob.display().to_string(),
+    ])?;
+    assert!(write_blob.status.success());
+
+    // Copy text A -> B into a nested directory that does not exist yet on B.
+    let copy_text = run_cli(&[
+        "file-copy",
+        "--from-profile",
+        &profile_a.display().to_string(),
+        "--from-path",
+        "data/text.txt",
+        "--to-profile",
+        &profile_b.display().to_string(),
+        "--to-path",
+        "copied/text.txt",
+    ])?;
+    assert!(
+        copy_text.status.success(),
+        "text copy failed: {}",
+        String::from_utf8_lossy(&copy_text.stderr)
+    );
+    assert!(!root_b.path().join("copied").exists() || root_b.path().join("copied").is_dir());
+    let copied_text = std::fs::read_to_string(root_b.path().join("copied/text.txt"))?;
+    assert_eq!(copied_text, "hello node-b\n");
+
+    // Copy binary A -> B with end-to-end checksum verification.
+    let copy_blob = run_cli(&[
+        "file-copy",
+        "--from-profile",
+        &profile_a.display().to_string(),
+        "--from-path",
+        "data/blob.bin",
+        "--to-profile",
+        &profile_b.display().to_string(),
+        "--to-path",
+        "copied/blob.bin",
+        "--checksum",
+    ])?;
+    assert!(
+        copy_blob.status.success(),
+        "binary copy failed: {}",
+        String::from_utf8_lossy(&copy_blob.stderr)
+    );
+    let copied_blob = std::fs::read(root_b.path().join("copied/blob.bin"))?;
+    assert_eq!(copied_blob, blob);
+    assert_eq!(test_sha256_hex(&copied_blob), blob_sha);
+
+    Ok(())
+}
+
+#[test]
+fn cli_file_copy_uses_chunked_upload_for_larger_files() -> Result<()> {
+    let token = "test-token";
+    let root_a = tempfile::tempdir()?;
+    let root_b = tempfile::tempdir()?;
+    let profiles = tempfile::tempdir()?;
+    let harness_a = CliServerHarness::start(root_a.path(), token)?;
+    let harness_b = CliServerHarness::start(root_b.path(), token)?;
+    let profile_a = profiles.path().join("node-a.env");
+    let profile_b = profiles.path().join("node-b.env");
+    write_profile(&profile_a, &harness_a.base_url, token, root_a.path())?;
+    write_profile(&profile_b, &harness_b.base_url, token, root_b.path())?;
+
+    // A few KiB so a 9-byte chunk size forces many chunks on the upload side.
+    let pattern = b"agentplane-file-copy-chunk-";
+    let mut content = Vec::new();
+    while content.len() < 8 * 1024 {
+        content.extend_from_slice(pattern);
+    }
+    let checksum = test_sha256_hex(&content);
+    let write_large = run_cli(&[
+        "file-write",
+        "--server",
+        &harness_a.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &root_a.path().display().to_string(),
+        "--path",
+        "data/large.txt",
+        "--content",
+        &String::from_utf8_lossy(&content),
+    ])?;
+    assert!(write_large.status.success());
+
+    let copy = run_cli(&[
+        "file-copy",
+        "--from-profile",
+        &profile_a.display().to_string(),
+        "--from-path",
+        "data/large.txt",
+        "--to-profile",
+        &profile_b.display().to_string(),
+        "--to-path",
+        "copied/large.txt",
+        "--chunk-size",
+        "9",
+        "--checksum",
+    ])?;
+    assert!(
+        copy.status.success(),
+        "chunked copy failed: {}",
+        String::from_utf8_lossy(&copy.stderr)
+    );
+    let copied = std::fs::read(root_b.path().join("copied/large.txt"))?;
+    assert_eq!(copied, content);
+    assert_eq!(test_sha256_hex(&copied), checksum);
+
+    Ok(())
+}
+
+#[test]
+fn cli_file_copy_rejects_missing_source_and_escaping_destination() -> Result<()> {
+    let token = "test-token";
+    let root_a = tempfile::tempdir()?;
+    let root_b = tempfile::tempdir()?;
+    let profiles = tempfile::tempdir()?;
+    let harness_a = CliServerHarness::start(root_a.path(), token)?;
+    let harness_b = CliServerHarness::start(root_b.path(), token)?;
+    let profile_a = profiles.path().join("node-a.env");
+    let profile_b = profiles.path().join("node-b.env");
+    write_profile(&profile_a, &harness_a.base_url, token, root_a.path())?;
+    write_profile(&profile_b, &harness_b.base_url, token, root_b.path())?;
+
+    let write_seed = run_cli(&[
+        "file-write",
+        "--server",
+        &harness_a.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &root_a.path().display().to_string(),
+        "--path",
+        "seed.txt",
+        "--content",
+        "payload",
+    ])?;
+    assert!(write_seed.status.success());
+
+    // Missing source: the path does not exist on node A.
+    let missing = run_cli(&[
+        "file-copy",
+        "--from-profile",
+        &profile_a.display().to_string(),
+        "--from-path",
+        "does-not-exist.txt",
+        "--to-profile",
+        &profile_b.display().to_string(),
+        "--to-path",
+        "out.txt",
+    ])?;
+    assert!(
+        !missing.status.success(),
+        "missing source should fail: {}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+    assert!(!root_b.path().join("out.txt").exists());
+
+    // Escaping destination: ".." must be rejected by the destination server.
+    let escape = run_cli(&[
+        "file-copy",
+        "--from-profile",
+        &profile_a.display().to_string(),
+        "--from-path",
+        "seed.txt",
+        "--to-profile",
+        &profile_b.display().to_string(),
+        "--to-path",
+        "../escape.txt",
+    ])?;
+    assert!(
+        !escape.status.success(),
+        "escaping destination should fail: {}",
+        String::from_utf8_lossy(&escape.stdout)
+    );
+    assert!(!root_b.path().join("escape.txt").exists());
+
+    Ok(())
+}

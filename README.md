@@ -466,6 +466,26 @@ fail fast instead of racing on the same target. If the client dies mid-upload, r
 the same `--agent-id` and `--lock-key` to recover the existing upload session; a different
 agent id remains blocked.
 
+Copy a single file between two profiles (for example node13 and node14) in one step, instead
+of `file-read` to a local temp file, `file-write` to the other node, and cleaning up by hand.
+Each side is described by its own `--profile` file; no tokens are passed on the command line,
+and the destination uploads in chunks through the same transport as `file-upload`:
+
+```bash
+./agentplane file-copy \
+  --from-profile /tmp/node14.env \
+  --from-path metadata.json \
+  --to-profile /tmp/node13.env \
+  --to-path metadata.json \
+  --checksum
+```
+
+`--from-remote-root` / `--to-remote-root` override each profile's `AP_REMOTE_ROOT`,
+`--chunk-size` sizes the chunked upload (default 1048576), `--atomic` writes the destination
+atomically, and `--checksum` stats the destination after the copy and verifies its SHA-256
+matches the source. Only single files are supported in this version; the source is pulled with
+`file-read`, so very large sources are bounded by that single-response transport.
+
 Wait for generated output:
 
 ```bash
@@ -581,7 +601,7 @@ Renew or release the lease at task boundaries:
 | Connectivity | `health` |
 | Sync | `sync-init`, `sync-run` |
 | Processes | `process-start`, `process-run`, `process-get`, `process-list`, `process-read`, `process-write`, `process-terminate`, `process-cleanup` |
-| Files | `file-read`, `file-stat`, `file-wait`, `file-write`, `file-upload`, `file-delete`, `file-find`, `file-list` |
+| Files | `file-read`, `file-stat`, `file-wait`, `file-write`, `file-upload`, `file-copy`, `file-delete`, `file-find`, `file-list` |
 | Accelerators | `accelerator-status`, `accelerator-preflight`, `accelerator-wait-idle`, `gpu-status`, `gpu-preflight`, `gpu-wait-idle` |
 | Shared mode | `mode-get`, `mode-switch`, `lease-renew`, `lease-release` |
 | Server | `server` |

@@ -58,6 +58,7 @@ enum CommandKind {
     FileWait(FileWaitArgs),
     FileWrite(FileWriteArgs),
     FileUpload(FileUploadArgs),
+    FileCopy(FileCopyArgs),
     FileDelete(FileDeleteArgs),
     FileFind(FileFindArgs),
     FileList(FileListArgs),
@@ -697,6 +698,68 @@ struct FileUploadArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Agent usage:\n  Use file-copy to move a single file between two profiles (for example node13 <-> node14) in one step, instead of file-read to a local temp file, file-write to the other node, and cleaning up by hand. Each side is addressed by its own --profile file; no tokens are passed on the command line."
+)]
+struct FileCopyArgs {
+    #[arg(
+        long = "from-profile",
+        value_name = "PATH",
+        help = "Profile file (KEY=VALUE) describing the source server."
+    )]
+    from_profile: PathBuf,
+    #[arg(
+        long = "to-profile",
+        value_name = "PATH",
+        help = "Profile file (KEY=VALUE) describing the destination server."
+    )]
+    to_profile: PathBuf,
+    #[arg(
+        long = "from-path",
+        value_name = "REMOTE_REL_PATH",
+        help = "Source file path relative to the source remote root."
+    )]
+    from_path: String,
+    #[arg(
+        long = "to-path",
+        value_name = "REMOTE_REL_PATH",
+        help = "Destination file path relative to the destination remote root."
+    )]
+    to_path: String,
+    #[arg(
+        long = "from-remote-root",
+        value_name = "PATH",
+        help = "Override the source profile's AP_REMOTE_ROOT."
+    )]
+    from_remote_root: Option<PathBuf>,
+    #[arg(
+        long = "to-remote-root",
+        value_name = "PATH",
+        help = "Override the destination profile's AP_REMOTE_ROOT."
+    )]
+    to_remote_root: Option<PathBuf>,
+    #[arg(
+        long = "chunk-size",
+        value_name = "BYTES",
+        default_value_t = 1024 * 1024,
+        help = "Chunk size used by the chunked upload to the destination."
+    )]
+    chunk_size: usize,
+    #[arg(
+        long = "atomic",
+        default_value_t = false,
+        help = "Write the destination file atomically."
+    )]
+    atomic: bool,
+    #[arg(
+        long = "checksum",
+        default_value_t = false,
+        help = "After copying, stat the destination and verify its SHA-256 matches the source."
+    )]
+    checksum: bool,
+}
+
+#[derive(Debug, Args)]
 struct FileDeleteArgs {
     #[command(flatten)]
     auth: ClientAuthArgs,
@@ -784,6 +847,7 @@ pub async fn run() -> Result<ExitCode> {
         CommandKind::FileWait(args) => file::file_wait(args, &profile).await,
         CommandKind::FileWrite(args) => file::file_write(args, &profile).await,
         CommandKind::FileUpload(args) => file::file_upload(args, &profile).await,
+        CommandKind::FileCopy(args) => file::file_copy(args, &profile).await,
         CommandKind::FileDelete(args) => file::file_delete(args, &profile).await,
         CommandKind::FileFind(args) => file::file_find(args, &profile).await,
         CommandKind::FileList(args) => file::file_list(args, &profile).await,
