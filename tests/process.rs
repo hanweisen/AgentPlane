@@ -1079,6 +1079,22 @@ AP_REMOTE_ROOT={}
 }
 
 #[test]
+fn cli_process_help_recommends_run_vs_start_usage() -> Result<()> {
+    let start_help = run_cli(&["process-start", "--help"])?;
+    assert!(start_help.status.success());
+    let start_stdout = String::from_utf8(start_help.stdout)?;
+    assert!(start_stdout.contains("Use process-start for long-running producers"));
+    assert!(start_stdout.contains("Use process-run for short build/check commands"));
+
+    let run_help = run_cli(&["process-run", "--help"])?;
+    assert!(run_help.status.success());
+    let run_stdout = String::from_utf8(run_help.stdout)?;
+    assert!(run_stdout.contains("Use process-run for short build/check commands"));
+    assert!(run_stdout.contains("Use process-start for long-running producers"));
+    Ok(())
+}
+
+#[test]
 fn cli_process_run_save_output_path_writes_full_output() -> Result<()> {
     let remote_root = tempfile::tempdir()?;
     let token = "test-token";

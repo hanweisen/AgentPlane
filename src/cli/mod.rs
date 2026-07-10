@@ -354,6 +354,9 @@ struct GpuWaitIdleArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Agent usage:\n  Use process-start for long-running producers, samplers, servers, and benchmarks that should keep running while you do other work.\n  Use process-run for short build/check commands and consumers/drivers where the local exit code should match the remote command."
+)]
 struct ProcessStartArgs {
     #[command(flatten)]
     auth: ClientAuthArgs,
@@ -395,6 +398,9 @@ struct ProcessStartArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Agent usage:\n  Use process-run for short build/check commands and consumers/drivers where the local exit code should match the remote command.\n  Use process-start for long-running producers, samplers, servers, and benchmarks that should keep running while you do other work."
+)]
 struct ProcessRunArgs {
     #[command(flatten)]
     auth: ClientAuthArgs,

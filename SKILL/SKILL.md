@@ -337,6 +337,9 @@ code to match the remote process, prefer `process-run`:
 `process-read`. Use a stable `--process-id`; repeating the same command with the same
 configuration can reconnect to the existing process instead of starting duplicate work. Use
 `--tail-on-error <BYTES>` when failures should include the last retained output on stderr.
+Use `process-start` instead for long-running producers, samplers, servers, and benchmarks
+that should keep running while you do other work. Use `process-run` for short build/check
+commands and consumers/drivers where the local exit code should match the remote command.
 For long jobs, add `--save-output-path <relative-path>` so the remote root keeps a full
 stdout/stderr copy even when the in-memory output buffer is trimmed. If the CLI reports that
 the output cursor expired and no save path was used, rerun with a larger

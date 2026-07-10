@@ -329,6 +329,10 @@ If a network request times out, retry `process-start` with the same `--process-i
 same arguments. AgentPlane will reconnect to the existing process instead of starting a
 duplicate command.
 
+Use `process-start` for long-running producers, samplers, servers, and benchmarks that
+should keep running while you do other work. Use `process-run` for short build/check
+commands and consumers/drivers where the local exit code should match the remote command.
+
 For long jobs, add `--save-output-path <relative-path>` to `process-start` or
 `process-run` to keep a full stdout/stderr copy under the remote root even when the
 in-memory output buffer is truncated.
