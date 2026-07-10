@@ -15,7 +15,7 @@ pub(crate) struct ClientProfileArgs {
         global = true,
         visible_alias = "env-file",
         value_name = "PATH",
-        help = "Load AP_SERVER, AP_TOKEN, AP_REMOTE_ROOT, AP_HEADER[_N], and retry settings from a KEY=VALUE file."
+        help = "Load AP_SERVER, AP_TOKEN, AP_REMOTE_ROOT, AP_LABEL, AP_HEADER[_N], and retry settings from a KEY=VALUE file."
     )]
     pub(crate) profile: Option<PathBuf>,
 }
@@ -67,6 +67,7 @@ pub(crate) struct ClientProfile {
     pub(crate) connect_retry_delay_ms: Option<u64>,
     pub(crate) agent_id: Option<String>,
     pub(crate) agent_id_file: Option<PathBuf>,
+    pub(crate) label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +145,7 @@ pub(crate) fn load_client_profile(path: Option<&PathBuf>) -> Result<ClientProfil
         socks5_hostname: values.get("AP_SOCKS5_HOSTNAME").cloned(),
         agent_id: values.get("AP_AGENT_ID").cloned(),
         agent_id_file: values.get("AP_AGENT_ID_FILE").map(PathBuf::from),
+        label: values.get("AP_LABEL").cloned(),
         ..ClientProfile::default()
     };
     profile.headers.extend(profile_headers(&values));

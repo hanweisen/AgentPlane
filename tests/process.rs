@@ -2283,3 +2283,99 @@ fn cli_process_status_reports_failed_status() -> Result<()> {
     ])?;
     Ok(())
 }
+
+#[test]
+fn cli_process_status_profile_label_surfaces_in_text_and_json() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+    let profile_dir = tempfile::tempdir()?;
+    let profile_path = profile_dir.path().join("node13.env");
+    std::fs::write(
+        &profile_path,
+        format!(
+            "AP_SERVER={}\nAP_TOKEN={token}\nAP_REMOTE_ROOT={}\nAP_LABEL=node13\n",
+            harness.base_url,
+            remote_root.path().display()
+        ),
+    )?;
+
+    let started = run_cli(&[
+        "--profile",
+        &profile_path.display().to_string(),
+        "process-start",
+        "--process-id",
+        "label-running",
+        "--",
+        "bash",
+        "-lc",
+        "echo label-output && sleep 5",
+    ])?;
+    assert!(
+        started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Text mode: a metadata header identifies the node before the process lines.
+    let status_text = run_cli(&[
+        "--profile",
+        &profile_path.display().to_string(),
+        "process-status",
+        "--text",
+        "--process-id",
+        "label-running",
+    ])?;
+    assert!(
+        status_text.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status_text.stderr)
+    );
+    let text = String::from_utf8(status_text.stdout)?;
+    assert!(
+        text.contains("# label=node13 server="),
+        "text header missing: {text}"
+    );
+    assert!(
+        text.contains("label-running"),
+        "process line missing: {text}"
+    );
+
+    // JSON mode: label and server merge in without changing ok semantics.
+    let status_json = run_cli(&[
+        "--profile",
+        &profile_path.display().to_string(),
+        "process-status",
+        "--process-id",
+        "label-running",
+    ])?;
+    assert!(status_json.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&status_json.stdout)?;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["label"], "node13");
+    assert_eq!(body["server"], harness.base_url);
+    assert_eq!(body["process"]["process_id"], "label-running");
+
+    // List mode JSON also carries the identity for multi-node disambiguation.
+    let status_list = run_cli(&[
+        "--profile",
+        &profile_path.display().to_string(),
+        "process-status",
+        "--label",
+        "node13-dr",
+    ])?;
+    assert!(status_list.status.success());
+    let list_body: serde_json::Value = serde_json::from_slice(&status_list.stdout)?;
+    assert_eq!(list_body["label"], "node13-dr");
+    assert_eq!(list_body["server"], harness.base_url);
+
+    let _ = run_cli(&[
+        "--profile",
+        &profile_path.display().to_string(),
+        "process-terminate",
+        "--process-id",
+        "label-running",
+    ])?;
+    Ok(())
+}

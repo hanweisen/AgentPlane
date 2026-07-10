@@ -54,7 +54,18 @@ pub(super) async fn health(args: HealthArgs, profile: &ClientProfile) -> Result<
 
     if response.status() == StatusCode::OK {
         let body: SimpleResponse = response.json().await?;
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        // Merge client-side identity (server, optional label) into the printed
+        // JSON without changing the wire SimpleResponse contract. `ok` stays the
+        // source of truth for the exit code.
+        let label = args.label.clone().or_else(|| profile.label.clone());
+        let mut value = serde_json::to_value(&body)?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("server".to_string(), serde_json::json!(server));
+            if let Some(label) = &label {
+                obj.insert("label".to_string(), serde_json::json!(label));
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(if body.ok {
             ExitCode::SUCCESS
         } else {

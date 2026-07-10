@@ -110,6 +110,8 @@ pub(super) async fn process_status(
     profile: &ClientProfile,
 ) -> Result<ExitCode> {
     let auth = args.auth.resolve(profile)?;
+    let label = args.label.clone().or_else(|| profile.label.clone());
+    let server = auth.server.clone();
     match args.process_id {
         Some(process_id) => {
             let payload = ProcessGetRequest { process_id };
@@ -117,9 +119,11 @@ pub(super) async fn process_status(
             if response.status() == StatusCode::OK {
                 let body: ProcessGetResponse = response.json().await?;
                 if args.text {
+                    print_identity_header(&label, &server);
                     print_process_info_text(&body.process);
                 } else {
-                    println!("{}", serde_json::to_string_pretty(&body)?);
+                    let value = enrich_with_identity(serde_json::to_value(&body)?, &label, &server);
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                 }
                 return Ok(ExitCode::SUCCESS);
             }
@@ -142,16 +146,45 @@ pub(super) async fn process_status(
                     "processes": processes,
                 });
                 if args.text {
+                    print_identity_header(&label, &server);
                     for process in &processes {
                         print_process_info_text(process);
                     }
                 } else {
-                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    let value = enrich_with_identity(output, &label, &server);
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                 }
                 return Ok(ExitCode::SUCCESS);
             }
             print_error_response(response).await
         }
+    }
+}
+
+/// Merge client-side identity (server, optional label) into a status JSON value
+/// without changing the wire protocol structs. Callers still derive the exit
+/// code from the original response body.
+fn enrich_with_identity(
+    mut value: serde_json::Value,
+    label: &Option<String>,
+    server: &str,
+) -> serde_json::Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("server".to_string(), serde_json::json!(server));
+        if let Some(label) = label {
+            obj.insert("label".to_string(), serde_json::json!(label));
+        }
+    }
+    value
+}
+
+/// Print a `#`-prefixed metadata header so multi-node text output stays
+/// unambiguous when an agent concatenates `process-status --text` from several
+/// profiles.
+fn print_identity_header(label: &Option<String>, server: &str) {
+    match label {
+        Some(label) => println!("# label={label} server={server}"),
+        None => println!("# server={server}"),
     }
 }
 

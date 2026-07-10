@@ -176,6 +176,11 @@ struct HealthArgs {
         help = "Repeatable raw HTTP header like 'Name: value' added to every request."
     )]
     header: Vec<String>,
+    #[arg(
+        long = "label",
+        help = "Human-readable node label shown in health output. Overrides AP_LABEL."
+    )]
+    label: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -553,6 +558,11 @@ struct ProcessStatusArgs {
     limit: usize,
     #[arg(long = "text", default_value_t = false)]
     text: bool,
+    #[arg(
+        long = "label",
+        help = "Human-readable node label shown in process-status output. Overrides AP_LABEL."
+    )]
+    label: Option<String>,
 }
 
 #[derive(Debug, Args)]

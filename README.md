@@ -222,6 +222,7 @@ AP_SOCKS5_HOSTNAME=127.0.0.1:1086
 AP_HEADER_1=X-Workspace-Context: example
 AP_CONNECT_RETRIES=5
 AP_CONNECT_RETRY_DELAY_MS=1000
+AP_LABEL=node13
 EOF
 
 ./agentplane --profile /tmp/agentplane.env process-list
@@ -238,6 +239,13 @@ AP_AGENT_ID_FILE=/workspace/mnt/agents/minimax-a.id
 
 CLI values take precedence over profile values: `--agent-id`, then `--agent-id-file`, then
 `AP_AGENT_ID`, then `AP_AGENT_ID_FILE`. Sync lock conflict messages include this identity.
+
+`AP_LABEL` is an optional human-readable node label (for example `node13` or `node14`) that
+helps disambiguate output when you drive several profiles. `health` and `process-status`
+merge the label and the server address into their JSON output, and `process-status --text`
+prints a `# label=<label> server=<server>` header before the process lines. Override the
+profile label per invocation with `--label`. The label is client-side only; it does not
+change the request or the server response.
 
 ## Common Workflows
 
