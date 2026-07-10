@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ResourceClaim;
+use super::{AcceleratorKind, ResourceClaim};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessStartRequest {
@@ -200,6 +200,10 @@ pub struct ProcessCleanupRequest {
     pub kill: bool,
     #[serde(default)]
     pub signal: Option<String>,
+    /// When set on a dry-run, the server attaches an accelerator occupancy
+    /// summary (per-PID device + memory) of the given kind. Ignored for --kill.
+    #[serde(default)]
+    pub accelerator_summary: Option<AcceleratorKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +215,28 @@ pub struct ProcessCleanupResponse {
     pub signaled: Vec<CleanupProcess>,
     pub skipped: Vec<CleanupProcess>,
     pub agent_hint: String,
+    /// Present only when a dry-run requested an accelerator occupancy summary.
+    /// `available: false` means the provider could not be queried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accelerator_summary: Option<ProcessCleanupAcceleratorSummary>,
+}
+
+/// Per-PID accelerator occupancy attached to a dry-run cleanup report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessCleanupAcceleratorSummary {
+    pub kind: AcceleratorKind,
+    pub available: bool,
+    pub reason: Option<String>,
+    /// Occupancy for matched PIDs that the accelerator provider reports as
+    /// holding device memory.
+    pub processes: Vec<ProcessCleanupAcceleratorProcess>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessCleanupAcceleratorProcess {
+    pub pid: i32,
+    pub device_index: Option<u32>,
+    pub used_memory_mib: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

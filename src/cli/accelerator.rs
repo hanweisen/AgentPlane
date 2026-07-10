@@ -274,7 +274,7 @@ async fn post_accelerator_status(
     Err(process_error_response(response).await)
 }
 
-fn accelerator_kind_from_arg(kind: AcceleratorKindArg) -> AcceleratorKind {
+pub(super) fn accelerator_kind_from_arg(kind: AcceleratorKindArg) -> AcceleratorKind {
     match kind {
         AcceleratorKindArg::Gpu => AcceleratorKind::Gpu,
         AcceleratorKindArg::Npu => AcceleratorKind::Npu,

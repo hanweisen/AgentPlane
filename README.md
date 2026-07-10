@@ -452,6 +452,23 @@ text mode prints a `Reconfirm:` verdict line.
   --reconfirm
 ```
 
+Add `--accelerator-summary gpu|npu` to a `--dry-run` to attach per-PID accelerator occupancy (device
+index + device memory) for the matched processes, so a residual `xgl|vllm|mooncake|msprof|nsys`
+report shows what each process holds before you decide to kill. The summary is server-side (it runs
+`nvidia-smi` / `npu-smi`), degrades to `available: false` with a `reason` if the provider is missing,
+and only lists PIDs that are both matched and reported by the provider as holding device memory.
+Ignored for `--kill`.
+
+```bash
+./agentplane process-cleanup \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --match 'xgl|vllm|mooncake' \
+  --dry-run \
+  --accelerator-summary npu \
+  --text
+```
+
 ### File Operations
 
 Write a text file:

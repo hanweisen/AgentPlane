@@ -563,7 +563,7 @@ pub async fn handle_process_terminate(
 }
 
 pub async fn handle_process_cleanup(
-    _state: &ServerState,
+    state: &ServerState,
     payload: ProcessCleanupRequest,
 ) -> Result<ProcessCleanupResponse> {
     let process_match = payload.process_match.trim();
@@ -608,6 +608,20 @@ pub async fn handle_process_cleanup(
         }
     }
 
+    // Optional accelerator occupancy summary on dry-run (feedback §6). Built
+    // only when requested and only for dry-run, so a --kill never pays the smi
+    // cost and never blocks the signal path.
+    let accelerator_summary = if dry_run {
+        if let Some(kind) = payload.accelerator_summary {
+            let pids: Vec<i32> = matched.iter().map(|process| process.pid).collect();
+            Some(super::accelerator::accelerator_process_occupancy(state, kind, &pids).await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(ProcessCleanupResponse {
         ok: true,
         dry_run,
@@ -620,6 +634,7 @@ pub async fn handle_process_cleanup(
         } else {
             "Explicit cleanup signal was sent only to matched processes; review process status before sending stronger signals.".to_string()
         },
+        accelerator_summary,
     })
 }
 

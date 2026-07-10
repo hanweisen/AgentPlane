@@ -2,8 +2,8 @@ mod common;
 
 use std::process::Command;
 
-use agentplane::protocol::{AcceleratorKind, AcceleratorStatusRequest};
-use agentplane::server::{ServerState, handle_accelerator_status};
+use agentplane::protocol::{AcceleratorKind, AcceleratorStatusRequest, ProcessCleanupRequest};
+use agentplane::server::{ServerState, handle_accelerator_status, handle_process_cleanup};
 use common::*;
 
 #[tokio::test]
@@ -543,5 +543,223 @@ fn cli_gpu_wait_idle_waits_until_gpu_is_stably_under_threshold() -> Result<()> {
     assert_eq!(body["passed"], true);
     assert_eq!(body["stable_seconds"], 1);
     assert!(body["observed_stable_seconds"].as_u64().unwrap_or(0) >= 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_cleanup_dry_run_attaches_gpu_occupancy_for_matched_pids() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    // Spawn a child whose command contains the marker so scan_cleanup_processes
+    // can find it; long sleep so it survives until the assertion.
+    let marker = format!("accel_cleanup_marker_{}", std::process::id());
+    let mut child = Command::new("python3")
+        .args(["-c", "import time; time.sleep(30)", &marker])
+        .spawn()?;
+    let child_pid = child.id() as i32;
+
+    let result: Result<()> = async {
+        // The child PID holds 256 MiB on device 0; a second compute process on
+        // a different PID (999999) must be filtered out of the summary because
+        // it is not in the matched set.
+        let mock = remote_root.path().join("nvidia-smi");
+        write_mock_nvidia_smi(
+            &mock,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --query-gpu=*)\n    printf '%s\\n' '0, NVIDIA A800, GPU-zero, 128, 81920, 7, P0, 101.50, 42'\n    ;;\n  --query-compute-apps=*)\n    printf '%s\\n' 'GPU-zero, {child_pid}, 256'\n    printf '%s\\n' 'GPU-zero, 999999, 512'\n    ;;\n  *) exit 1 ;;\nesac\n"
+            ),
+        )?;
+        let mut state = ServerState::new(
+            "test-token".to_string(),
+            vec![remote_root.path().to_path_buf()],
+        );
+        state.nvidia_smi_path = Some(mock);
+
+        // Wait for the matcher to see the child.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let response = handle_process_cleanup(
+                &state,
+                ProcessCleanupRequest {
+                    process_match: marker.clone(),
+                    dry_run: true,
+                    kill: false,
+                    signal: None,
+                    accelerator_summary: Some(AcceleratorKind::Gpu),
+                },
+            )
+            .await?;
+            if response
+                .matched
+                .iter()
+                .any(|process| process.pid == child_pid)
+            {
+                assert!(response.dry_run);
+                let summary = response
+                    .accelerator_summary
+                    .as_ref()
+                    .expect("accelerator_summary should be attached");
+                assert!(summary.available, "summary should be available");
+                assert_eq!(summary.kind, AcceleratorKind::Gpu);
+                // Only the child PID should appear; the 999999 PID must be filtered.
+                let holding: Vec<_> = summary
+                    .processes
+                    .iter()
+                    .map(|process| process.pid)
+                    .collect();
+                assert!(holding.contains(&child_pid), "child pid missing: {holding:?}");
+                assert!(
+                    !holding.contains(&999999),
+                    "unmatched pid leaked into summary: {holding:?}"
+                );
+                let child_occ = summary
+                    .processes
+                    .iter()
+                    .find(|process| process.pid == child_pid)
+                    .expect("child occupancy present");
+                assert_eq!(child_occ.device_index, Some(0));
+                assert_eq!(child_occ.used_memory_mib, Some(256));
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("cleanup dry-run never matched child pid {child_pid}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[tokio::test]
+async fn process_cleanup_dry_run_attaches_npu_occupancy_for_matched_pids() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let mut child = Command::new("python3")
+        .args([
+            "-c",
+            "import time; time.sleep(30)",
+            &format!("accel_cleanup_npu_{}", std::process::id()),
+        ])
+        .spawn()?;
+    let child_pid = child.id() as i32;
+    let marker = format!("accel_cleanup_npu_{}", std::process::id());
+
+    let result: Result<()> = async {
+        let mock = remote_root.path().join("npu-smi");
+        write_mock_executable(
+            &mock,
+            &format!(
+                "#!/bin/sh\ncat <<'INFO'\n+------------------------------------------------------------------------------------------------+\n| NPU     Name      | Health          | Power(W)     Temp(C)           Hugepages-Usage(page)     |\n| Chip    Device    | Bus-Id          | AICore(%)    Memory-Usage(MB)                             |\n+===================+=================+==========================================================+\n| 0       910B      | OK              | 91.8         42                0    / 0                   |\n| 0       0         | 0000:C1:00.0    | 5            1024 / 65536                                 |\n+-------------------+-----------------+----------------------------------------------------------+\n| NPU     Chip      | Process id      | Process name             | Process memory(MB)      |\n+===================+=================+==========================================================+\n| 0       0         | {child_pid}   | agentplane               | 2048                    |\nINFO\n"
+            ),
+        )?;
+        let mut state = ServerState::new(
+            "test-token".to_string(),
+            vec![remote_root.path().to_path_buf()],
+        );
+        state.npu_smi_path = Some(mock);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let response = handle_process_cleanup(
+                &state,
+                ProcessCleanupRequest {
+                    process_match: marker.clone(),
+                    dry_run: true,
+                    kill: false,
+                    signal: None,
+                    accelerator_summary: Some(AcceleratorKind::Npu),
+                },
+            )
+            .await?;
+            if response
+                .matched
+                .iter()
+                .any(|process| process.pid == child_pid)
+            {
+                let summary = response
+                    .accelerator_summary
+                    .as_ref()
+                    .expect("npu summary should be attached");
+                assert!(summary.available);
+                assert_eq!(summary.kind, AcceleratorKind::Npu);
+                assert_eq!(summary.processes.len(), 1);
+                assert_eq!(summary.processes[0].pid, child_pid);
+                assert_eq!(summary.processes[0].device_index, Some(0));
+                assert_eq!(summary.processes[0].used_memory_mib, Some(2048));
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("cleanup dry-run never matched child pid {child_pid}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[tokio::test]
+async fn process_cleanup_dry_run_omits_summary_by_default() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let mock = remote_root.path().join("nvidia-smi");
+    write_mock_nvidia_smi(&mock, "#!/bin/sh\nexit 0\n")?;
+    let mut state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+    state.nvidia_smi_path = Some(mock);
+
+    let response = handle_process_cleanup(
+        &state,
+        ProcessCleanupRequest {
+            process_match: "definitely-not-running-zzz".to_string(),
+            dry_run: true,
+            kill: false,
+            signal: None,
+            accelerator_summary: None,
+        },
+    )
+    .await?;
+    assert!(response.dry_run);
+    // No summary requested -> field must be absent (None), not an empty object.
+    assert!(response.accelerator_summary.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_cleanup_dry_run_summary_reports_unavailable_when_smi_missing() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let mut state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+    // Point at a path that does not exist; occupancy must degrade gracefully.
+    state.nvidia_smi_path = Some(remote_root.path().join("missing-nvidia-smi"));
+
+    let response = handle_process_cleanup(
+        &state,
+        ProcessCleanupRequest {
+            process_match: "definitely-not-running-zzz".to_string(),
+            dry_run: true,
+            kill: false,
+            signal: None,
+            accelerator_summary: Some(AcceleratorKind::Gpu),
+        },
+    )
+    .await?;
+    let summary = response
+        .accelerator_summary
+        .as_ref()
+        .expect("summary should still be attached when unavailable");
+    assert!(!summary.available);
+    assert!(summary.reason.is_some());
+    assert!(summary.processes.is_empty());
     Ok(())
 }

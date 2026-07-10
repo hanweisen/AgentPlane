@@ -8,7 +8,7 @@ use super::ServerState;
 use super::util::parse_i32_field;
 use crate::protocol::{
     AcceleratorDevice, AcceleratorKind, AcceleratorProcess, AcceleratorStatusRequest,
-    AcceleratorStatusResponse,
+    AcceleratorStatusResponse, ProcessCleanupAcceleratorProcess, ProcessCleanupAcceleratorSummary,
 };
 
 pub async fn handle_accelerator_status(
@@ -668,4 +668,158 @@ fn parse_power_milliwatts(value: &str) -> Option<u64> {
     let value = parse_string_field(value)?;
     let watts = value.parse::<f64>().ok()?;
     Some((watts * 1000.0).round() as u64)
+}
+
+/// Query the accelerator provider for per-PID device occupancy and restrict it
+/// to the requested PIDs. Used by `process-cleanup --dry-run` to attach an
+/// occupancy summary (feedback §6). `available: false` means the provider could
+/// not be queried (missing binary, non-zero exit, no devices); the caller still
+/// gets a summary so the output shape is stable.
+pub(super) async fn accelerator_process_occupancy(
+    state: &ServerState,
+    kind: AcceleratorKind,
+    pids: &[i32],
+) -> ProcessCleanupAcceleratorSummary {
+    let want: BTreeSet<i32> = pids.iter().copied().collect();
+    match kind {
+        AcceleratorKind::Gpu => nvidia_occupancy(state, &want).await,
+        AcceleratorKind::Npu => huawei_npu_occupancy(state, &want).await,
+    }
+}
+
+async fn nvidia_occupancy(
+    state: &ServerState,
+    want: &BTreeSet<i32>,
+) -> ProcessCleanupAcceleratorSummary {
+    let Some(nvidia_smi) = state.nvidia_smi_path.as_ref() else {
+        return ProcessCleanupAcceleratorSummary {
+            kind: AcceleratorKind::Gpu,
+            available: false,
+            reason: Some("nvidia-smi path not configured".to_string()),
+            processes: Vec::new(),
+        };
+    };
+    let gpu_output = match run_nvidia_smi(
+        nvidia_smi,
+        &[
+            "--query-gpu=index,name,uuid",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return ProcessCleanupAcceleratorSummary {
+                kind: AcceleratorKind::Gpu,
+                available: false,
+                reason: Some(format!("failed to run nvidia-smi: {error}")),
+                processes: Vec::new(),
+            };
+        }
+    };
+    // Index is field 0, uuid is field 2. Lines with fewer fields are skipped;
+    // real nvidia-smi always emits at least index,name,uuid here.
+    let mut uuid_to_index: BTreeMap<String, u32> = BTreeMap::new();
+    for line in String::from_utf8_lossy(&gpu_output.stdout).lines() {
+        let fields = parse_csv_line(line);
+        if fields.len() < 3 {
+            continue;
+        }
+        if let (Some(index), Some(uuid)) =
+            (parse_u32_field(&fields[0]), parse_string_field(&fields[2]))
+        {
+            uuid_to_index.insert(uuid, index);
+        }
+    }
+    let proc_output = match run_nvidia_smi(
+        nvidia_smi,
+        &[
+            "--query-compute-apps=gpu_uuid,pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return ProcessCleanupAcceleratorSummary {
+                kind: AcceleratorKind::Gpu,
+                available: false,
+                reason: Some(format!("failed to run nvidia-smi: {error}")),
+                processes: Vec::new(),
+            };
+        }
+    };
+    let processes = parse_nvidia_compute_processes(
+        &String::from_utf8_lossy(&proc_output.stdout),
+        &uuid_to_index,
+    );
+    let filtered = processes
+        .into_iter()
+        .filter(|process| want.contains(&process.pid))
+        .map(|process| ProcessCleanupAcceleratorProcess {
+            pid: process.pid,
+            device_index: process.gpu_index,
+            used_memory_mib: process.used_memory_mib,
+        })
+        .collect();
+    ProcessCleanupAcceleratorSummary {
+        kind: AcceleratorKind::Gpu,
+        available: true,
+        reason: None,
+        processes: filtered,
+    }
+}
+
+async fn huawei_npu_occupancy(
+    state: &ServerState,
+    want: &BTreeSet<i32>,
+) -> ProcessCleanupAcceleratorSummary {
+    let Some(npu_smi) = state.npu_smi_path.as_ref() else {
+        return ProcessCleanupAcceleratorSummary {
+            kind: AcceleratorKind::Npu,
+            available: false,
+            reason: Some("npu-smi path not configured".to_string()),
+            processes: Vec::new(),
+        };
+    };
+    let usage_output = match run_npu_smi(npu_smi, &["info"]).await {
+        Ok(output) => output,
+        Err(error) => {
+            return ProcessCleanupAcceleratorSummary {
+                kind: AcceleratorKind::Npu,
+                available: false,
+                reason: Some(format!("failed to run npu-smi: {error}")),
+                processes: Vec::new(),
+            };
+        }
+    };
+    if !usage_output.status.success() {
+        return ProcessCleanupAcceleratorSummary {
+            kind: AcceleratorKind::Npu,
+            available: false,
+            reason: Some(format!(
+                "npu-smi usage exited {}",
+                usage_output.status.code().unwrap_or(-1)
+            )),
+            processes: Vec::new(),
+        };
+    }
+    let processes = parse_huawei_npu_processes(&String::from_utf8_lossy(&usage_output.stdout));
+    let filtered = processes
+        .into_iter()
+        .filter(|process| want.contains(&process.pid))
+        .map(|process| ProcessCleanupAcceleratorProcess {
+            pid: process.pid,
+            device_index: process.gpu_index,
+            used_memory_mib: process.used_memory_mib,
+        })
+        .collect();
+    ProcessCleanupAcceleratorSummary {
+        kind: AcceleratorKind::Npu,
+        available: true,
+        reason: None,
+        processes: filtered,
+    }
 }

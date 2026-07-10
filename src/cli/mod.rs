@@ -565,6 +565,12 @@ struct ProcessCleanupArgs {
         help = "Upper bound for the --reconfirm settle window before reporting survivors."
     )]
     reconfirm_wait_ms: u64,
+    #[arg(
+        long = "accelerator-summary",
+        value_name = "gpu|npu",
+        help = "With --dry-run, attach per-PID accelerator occupancy (device index + device memory) of the given kind. Ignored for --kill."
+    )]
+    accelerator_summary: Option<AcceleratorKindArg>,
 }
 
 #[derive(Debug, Args)]
@@ -836,7 +842,7 @@ enum AgentModeArg {
     Shared,
 }
 
-#[derive(Debug, Clone, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum AcceleratorKindArg {
     Gpu,
     Npu,

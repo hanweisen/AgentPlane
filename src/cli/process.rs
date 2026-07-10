@@ -14,10 +14,10 @@ use crate::cli_client::{
 };
 use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
 use crate::protocol::{
-    CleanupProcess, ProcessCleanupRequest, ProcessCleanupResponse, ProcessGetRequest,
-    ProcessGetResponse, ProcessListResponse, ProcessReadRequest, ProcessReadResponse,
-    ProcessStartRequest, ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest,
-    SimpleResponse, parse_resource_claim_specs,
+    CleanupProcess, ProcessCleanupAcceleratorSummary, ProcessCleanupRequest,
+    ProcessCleanupResponse, ProcessGetRequest, ProcessGetResponse, ProcessListResponse,
+    ProcessReadRequest, ProcessReadResponse, ProcessStartRequest, ProcessStartResponse,
+    ProcessTerminateRequest, ProcessWriteRequest, SimpleResponse, parse_resource_claim_specs,
 };
 
 use super::{
@@ -413,11 +413,15 @@ pub(super) async fn process_cleanup(
         bail!("--signal is only valid with --kill");
     }
     let auth = args.auth.resolve(profile)?;
+    let accelerator_summary = args
+        .accelerator_summary
+        .map(super::accelerator::accelerator_kind_from_arg);
     let payload = ProcessCleanupRequest {
         process_match: args.process_match.clone(),
         dry_run: args.dry_run || !args.kill,
         kill: args.kill,
         signal: args.signal.clone(),
+        accelerator_summary,
     };
     let response = post_json(&auth, "/v1/process/cleanup", &payload, false).await?;
     if response.status() != StatusCode::OK {
@@ -470,6 +474,7 @@ async fn reconfirm_signaled(
         dry_run: true,
         kill: false,
         signal: None,
+        accelerator_summary: None,
     };
     let deadline = Instant::now() + Duration::from_millis(args.reconfirm_wait_ms.max(1));
     let poll = Duration::from_millis(150);
@@ -511,6 +516,7 @@ fn print_process_cleanup_text(
                 print_cleanup_process(process);
             }
         }
+        print_accelerator_summary_text(body.accelerator_summary.as_ref());
         println!("{}", body.agent_hint);
         return Ok(());
     }
@@ -561,6 +567,44 @@ fn print_cleanup_process(process: &CleanupProcess) {
             .map(|reason| format!(" skip_reason={reason}"))
             .unwrap_or_default()
     );
+}
+
+/// Render the optional accelerator occupancy summary in text mode. Each
+/// matched PID that holds device memory gets a `pid=… device=… mem=…MiB` row;
+/// PIDs with no occupancy are listed separately so it's clear the summary ran.
+fn print_accelerator_summary_text(summary: Option<&ProcessCleanupAcceleratorSummary>) {
+    let Some(summary) = summary else {
+        return;
+    };
+    let kind = match summary.kind {
+        crate::protocol::AcceleratorKind::Gpu => "GPU",
+        crate::protocol::AcceleratorKind::Npu => "NPU",
+    };
+    if !summary.available {
+        let reason = summary.reason.as_deref().unwrap_or("unknown");
+        println!("Accelerator summary: {kind} unavailable ({reason}).");
+        return;
+    }
+    let holding: Vec<&crate::protocol::ProcessCleanupAcceleratorProcess> =
+        summary.processes.iter().collect();
+    println!(
+        "Accelerator summary: {kind}, {} process(es) holding device memory.",
+        holding.len()
+    );
+    for process in &holding {
+        let device = process
+            .device_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let mem = process
+            .used_memory_mib
+            .map(|mem| format!("{mem} MiB"))
+            .unwrap_or_else(|| "? MiB".to_string());
+        println!(
+            "  pid={} device={} used_memory={}",
+            process.pid, device, mem
+        );
+    }
 }
 
 async fn fetch_process_next_seq(auth: &ResolvedClientAuth, process_id: &str) -> Result<u64> {

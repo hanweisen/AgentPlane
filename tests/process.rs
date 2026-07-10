@@ -292,6 +292,7 @@ async fn process_cleanup_dry_run_reports_without_signaling_and_kill_requires_sig
                     dry_run: true,
                     kill: false,
                     signal: None,
+                    accelerator_summary: None,
                 },
             )
             .await?;
@@ -321,6 +322,7 @@ async fn process_cleanup_dry_run_reports_without_signaling_and_kill_requires_sig
             dry_run: false,
             kill: true,
             signal: None,
+            accelerator_summary: None,
         },
     )
     .await;
@@ -334,6 +336,7 @@ async fn process_cleanup_dry_run_reports_without_signaling_and_kill_requires_sig
             dry_run: false,
             kill: true,
             signal: Some("TERM".to_string()),
+            accelerator_summary: None,
         },
     )
     .await?;
