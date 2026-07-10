@@ -1739,3 +1739,345 @@ fn cli_large_output_respects_server_retention_and_resume_cursor() -> Result<()> 
     assert!(!stdout.contains("line-00001"));
     Ok(())
 }
+
+#[test]
+fn cli_process_status_single_running_process() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    let started = run_cli(&[
+        "process-start",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--process-id",
+        "status-running",
+        "--",
+        "bash",
+        "-lc",
+        "echo ready && sleep 2",
+    ])?;
+    assert!(
+        started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    // Wait for output to be produced
+    std::thread::sleep(Duration::from_millis(500));
+
+    let status = run_cli(&[
+        "process-status",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "status-running",
+    ])?;
+    assert!(
+        status.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(body["ok"], true);
+    let process = &body["process"];
+    assert_eq!(process["process_id"], "status-running");
+    assert_eq!(process["status"], "running");
+    assert!(
+        process["pid"].as_i64().is_some(),
+        "pid should be present for running process"
+    );
+    assert!(
+        process["elapsed_ms"].as_u64().is_some(),
+        "elapsed_ms should be present"
+    );
+    assert!(
+        process["last_output_at_unix_ms"].as_u64().is_some(),
+        "last_output_at_unix_ms should be present after output"
+    );
+
+    // Wait for process to exit
+    std::thread::sleep(Duration::from_millis(2000));
+
+    let status_after = run_cli(&[
+        "process-status",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "status-running",
+    ])?;
+    assert!(status_after.status.success());
+    let body_after: serde_json::Value = serde_json::from_slice(&status_after.stdout)?;
+    let process_after = &body_after["process"];
+    assert_eq!(process_after["status"], "exited");
+    assert_eq!(process_after["exit_code"], 0);
+    assert_eq!(process_after["exited"], true);
+
+    let _ = run_cli(&[
+        "process-terminate",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "status-running",
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn cli_process_status_list_with_limit() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    // Start first process
+    let started1 = run_cli(&[
+        "process-start",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--process-id",
+        "status-list-1",
+        "--",
+        "bash",
+        "-lc",
+        "echo first && sleep 5",
+    ])?;
+    assert!(started1.status.success());
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Start second process slightly later
+    let started2 = run_cli(&[
+        "process-start",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--process-id",
+        "status-list-2",
+        "--",
+        "bash",
+        "-lc",
+        "echo second && sleep 5",
+    ])?;
+    assert!(started2.status.success());
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Request only 1 most-recent process
+    let status = run_cli(&[
+        "process-status",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--limit",
+        "1",
+    ])?;
+    assert!(
+        status.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(body["ok"], true);
+    let processes = body["processes"]
+        .as_array()
+        .expect("processes should be an array");
+    assert_eq!(
+        processes.len(),
+        1,
+        "limit=1 should return exactly 1 process"
+    );
+    // The most recently active should be status-list-2 (started later)
+    assert_eq!(processes[0]["process_id"], "status-list-2");
+
+    // Cleanup
+    for pid in &["status-list-1", "status-list-2"] {
+        let _ = run_cli(&[
+            "process-terminate",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--process-id",
+            pid,
+        ])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_process_start_response_contains_next_commands_without_token() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "secret-token-value-123";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    let started = run_cli(&[
+        "process-start",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--process-id",
+        "next-cmd-test",
+        "--",
+        "bash",
+        "-lc",
+        "echo hello && exit 0",
+    ])?;
+    assert!(
+        started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&started.stdout)?;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["process_id"], "next-cmd-test");
+
+    let next = &body["next_commands"];
+    assert!(
+        next.is_object(),
+        "next_commands should be an object: {next}"
+    );
+    assert!(
+        next["status"]
+            .as_str()
+            .is_some_and(|s| s.contains("process-status")),
+        "next_commands.status should contain process-status: {next}"
+    );
+    assert!(
+        next["read"]
+            .as_str()
+            .is_some_and(|s| s.contains("process-read")),
+        "next_commands.read should contain process-read: {next}"
+    );
+    assert!(
+        next["terminate"]
+            .as_str()
+            .is_some_and(|s| s.contains("process-terminate")),
+        "next_commands.terminate should contain process-terminate: {next}"
+    );
+    // All three should reference the process id
+    for field in &["status", "read", "terminate"] {
+        assert!(
+            next[*field]
+                .as_str()
+                .is_some_and(|s| s.contains("next-cmd-test")),
+            "next_commands.{field} should contain the process id"
+        );
+    }
+    // Token must NOT appear anywhere in the response
+    let raw = serde_json::to_string(&body)?;
+    assert!(
+        !raw.contains(token),
+        "token value must not appear in process-start response"
+    );
+    assert!(
+        !raw.contains("secret-token-value"),
+        "token substring must not appear in process-start response"
+    );
+    // next_commands should use <token> placeholder
+    assert!(
+        next["status"]
+            .as_str()
+            .is_some_and(|s| s.contains("<token>")),
+        "next_commands should use <token> placeholder"
+    );
+    assert!(
+        next["status"]
+            .as_str()
+            .is_some_and(|s| !s.contains("--json")),
+        "process-status next command must not include unsupported --json"
+    );
+
+    let _ = run_cli(&[
+        "process-terminate",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "next-cmd-test",
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn cli_process_status_reports_failed_status() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    let started = run_cli(&[
+        "process-start",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--process-id",
+        "status-failed",
+        "--",
+        "sh",
+        "-c",
+        "exit 7",
+    ])?;
+    assert!(
+        started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    // Wait for the process to exit
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let status = run_cli(&[
+        "process-status",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "status-failed",
+    ])?;
+    assert!(
+        status.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(body["ok"], true);
+    let process = &body["process"];
+    assert_eq!(process["process_id"], "status-failed");
+    assert_eq!(process["status"], "failed");
+    assert_eq!(process["exit_code"], 7);
+    assert_eq!(process["exited"], true);
+
+    let _ = run_cli(&[
+        "process-terminate",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "status-failed",
+    ])?;
+    Ok(())
+}

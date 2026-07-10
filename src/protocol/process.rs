@@ -122,6 +122,14 @@ pub struct ProcessInfo {
     pub available_from_seq: u64,
     pub truncated: bool,
     pub output_retained: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub pid: Option<i32>,
+    #[serde(default)]
+    pub elapsed_ms: u128,
+    #[serde(default)]
+    pub last_output_at_unix_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -12,13 +12,14 @@ use crate::cli_client::{
 use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
 use crate::protocol::{
     CleanupProcess, ProcessCleanupRequest, ProcessCleanupResponse, ProcessGetRequest,
-    ProcessReadRequest, ProcessReadResponse, ProcessStartRequest, ProcessTerminateRequest,
-    ProcessWriteRequest, SimpleResponse, parse_resource_claim_specs,
+    ProcessGetResponse, ProcessListResponse, ProcessReadRequest, ProcessReadResponse,
+    ProcessStartRequest, ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest,
+    SimpleResponse, parse_resource_claim_specs,
 };
 
 use super::{
     ProcessCleanupArgs, ProcessGetArgs, ProcessListArgs, ProcessReadArgs, ProcessRunArgs,
-    ProcessStartArgs, ProcessTerminateArgs, ProcessWriteArgs,
+    ProcessStartArgs, ProcessStatusArgs, ProcessTerminateArgs, ProcessWriteArgs,
 };
 
 pub(super) async fn process_start(
@@ -42,8 +43,135 @@ pub(super) async fn process_start(
         kill_tree_on_terminate: args.kill_tree_on_terminate,
     };
     let body = post_process_start_with_recovery(&auth, &payload).await?;
+    let body = enrich_start_response(body, &auth);
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(serde::Serialize)]
+struct StartResponseWithNextCommands {
+    #[serde(flatten)]
+    base: ProcessStartResponse,
+    next_commands: NextCommands,
+}
+
+#[derive(serde::Serialize)]
+struct NextCommands {
+    status: String,
+    read: String,
+    terminate: String,
+}
+
+fn enrich_start_response(
+    body: ProcessStartResponse,
+    auth: &ResolvedClientAuth,
+) -> StartResponseWithNextCommands {
+    let pid = &body.process_id;
+    let base = format!(
+        "agentplane process-status --server {} --token <token> --process-id {}",
+        shell_quote(&auth.server),
+        shell_quote(pid),
+    );
+    let read_cmd = format!(
+        "agentplane process-read --server {} --token <token> --process-id {}",
+        shell_quote(&auth.server),
+        shell_quote(pid),
+    );
+    let terminate_cmd = format!(
+        "agentplane process-terminate --server {} --token <token> --process-id {}",
+        shell_quote(&auth.server),
+        shell_quote(pid),
+    );
+    let next_commands = NextCommands {
+        status: base,
+        read: format!("{read_cmd} --text --follow"),
+        terminate: terminate_cmd,
+    };
+    StartResponseWithNextCommands {
+        base: body,
+        next_commands,
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == ':' || c == '/')
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+pub(super) async fn process_status(
+    args: ProcessStatusArgs,
+    profile: &ClientProfile,
+) -> Result<ExitCode> {
+    let auth = args.auth.resolve(profile)?;
+    match args.process_id {
+        Some(process_id) => {
+            let payload = ProcessGetRequest { process_id };
+            let response = post_json(&auth, "/v1/process/get", &payload, true).await?;
+            if response.status() == StatusCode::OK {
+                let body: ProcessGetResponse = response.json().await?;
+                if args.text {
+                    print_process_info_text(&body.process);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            print_error_response(response).await
+        }
+        None => {
+            let response =
+                post_json(&auth, "/v1/process/list", &serde_json::json!({}), true).await?;
+            if response.status() == StatusCode::OK {
+                let body: ProcessListResponse = response.json().await?;
+                let mut processes = body.processes;
+                processes.sort_by(|a, b| {
+                    let a_key = a.last_output_at_unix_ms.unwrap_or(a.started_at_unix_ms);
+                    let b_key = b.last_output_at_unix_ms.unwrap_or(b.started_at_unix_ms);
+                    b_key.cmp(&a_key)
+                });
+                processes.truncate(args.limit);
+                let output = serde_json::json!({
+                    "ok": true,
+                    "processes": processes,
+                });
+                if args.text {
+                    for process in &processes {
+                        print_process_info_text(process);
+                    }
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            print_error_response(response).await
+        }
+    }
+}
+
+fn print_process_info_text(info: &crate::protocol::ProcessInfo) {
+    let exit_info = match info.exit_code {
+        Some(code) => format!("exit_code={code}"),
+        None => "exit_code=-".to_string(),
+    };
+    let pid = info
+        .pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let last_output = info
+        .last_output_at_unix_ms
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    println!(
+        "{:<24} status={:<8} pid={:<7} {} elapsed_ms={} last_output_at_unix_ms={}",
+        info.process_id, info.status, pid, exit_info, info.elapsed_ms, last_output
+    );
+    println!("  cwd={} command={}", info.cwd, info.command.join(" "));
 }
 
 pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -> Result<ExitCode> {

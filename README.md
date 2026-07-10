@@ -341,6 +341,34 @@ code as the local exit code:
   bash -lc 'cargo check'
 ```
 
+### Check Long-Running Task Status
+
+Use `process-status` to check whether a background task is still running, has exited, or
+failed — without reading the full output:
+
+```bash
+# Check a single process by id
+./agentplane process-status \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --process-id build-1
+
+# List the N most recently active processes (default: 10)
+./agentplane process-status \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --limit 5
+```
+
+The response includes `status` (`running`, `exited`, or `failed`), `pid`, `exit_code`,
+`elapsed_ms`, `started_at_unix_ms`, `last_output_at_unix_ms`, and the command summary.
+When listing without `--process-id`, processes are sorted by most recent activity
+(`last_output_at_unix_ms` falling back to `started_at_unix_ms`, descending).
+
+`process-start` responses include `next_commands` with ready-to-use `process-status`,
+`process-read`, and `process-terminate` command templates referencing the process id.
+The token is replaced with a `<token>` placeholder so the output is safe to log.
+
 ### Manage Process Trees
 
 Start a wrapper in its own process group:

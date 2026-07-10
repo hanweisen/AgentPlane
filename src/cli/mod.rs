@@ -48,6 +48,7 @@ enum CommandKind {
     ProcessWrite(ProcessWriteArgs),
     ProcessTerminate(ProcessTerminateArgs),
     ProcessCleanup(ProcessCleanupArgs),
+    ProcessStatus(ProcessStatusArgs),
     ModeGet(ModeGetArgs),
     ModeSwitch(ModeSwitchArgs),
     LeaseRenew(LeaseRenewArgs),
@@ -526,6 +527,18 @@ struct ProcessCleanupArgs {
 }
 
 #[derive(Debug, Args)]
+struct ProcessStatusArgs {
+    #[command(flatten)]
+    auth: ClientAuthArgs,
+    #[arg(long = "process-id")]
+    process_id: Option<String>,
+    #[arg(long = "limit", default_value_t = 10)]
+    limit: usize,
+    #[arg(long = "text", default_value_t = false)]
+    text: bool,
+}
+
+#[derive(Debug, Args)]
 struct ModeGetArgs {
     #[command(flatten)]
     auth: ClientAuthArgs,
@@ -745,6 +758,7 @@ pub async fn run() -> Result<ExitCode> {
         CommandKind::ProcessWrite(args) => process::process_write(args, &profile).await,
         CommandKind::ProcessTerminate(args) => process::process_terminate(args, &profile).await,
         CommandKind::ProcessCleanup(args) => process::process_cleanup(args, &profile).await,
+        CommandKind::ProcessStatus(args) => process::process_status(args, &profile).await,
         CommandKind::ModeGet(args) => mode::mode_get(args, &profile).await,
         CommandKind::ModeSwitch(args) => mode::mode_switch(args, &profile).await,
         CommandKind::LeaseRenew(args) => mode::lease_renew(args, &profile).await,

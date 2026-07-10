@@ -54,6 +54,7 @@ struct ProcessOutputState {
     total_bytes: usize,
     truncated: bool,
     open_streams: usize,
+    last_output_at_unix_ms: Option<u128>,
 }
 
 #[derive(Debug)]
@@ -77,6 +78,7 @@ pub(super) struct ManagedProcess {
     failure: Option<String>,
     finished_at: Option<Instant>,
     finished_at_unix_ms: Option<u128>,
+    pid: Option<i32>,
 }
 
 impl ManagedProcess {
@@ -361,6 +363,7 @@ pub(super) async fn handle_process_start_with_lease(
         }
     };
     let process_group_id = process_group_id(&child, requested_kill_tree_on_terminate);
+    let pid = process_group_id.or_else(|| child.id().and_then(|p| i32::try_from(p).ok()));
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -412,6 +415,7 @@ pub(super) async fn handle_process_start_with_lease(
             failure: None,
             finished_at: None,
             finished_at_unix_ms: None,
+            pid,
         },
     );
 
@@ -709,6 +713,7 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
         exit_code,
         failure,
         children_running,
+        pid,
         output,
     ) = {
         let mut processes = state.processes.lock().await;
@@ -731,16 +736,22 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
             process.exit_code,
             process.failure.clone(),
             process_children_running(process),
+            process.pid,
             Arc::clone(&process.output),
         )
     };
-
+    let now = unix_now_ms();
+    let elapsed_ms = finished_at_unix_ms
+        .unwrap_or(now)
+        .saturating_sub(started_at_unix_ms);
+    let status = compute_process_status(exit_code, failure.as_deref());
     let output = output.lock().await;
     let available_from_seq = output
         .chunks
         .first()
         .map(|chunk| chunk.seq)
         .unwrap_or(output.next_seq);
+    let last_output_at_unix_ms = output.last_output_at_unix_ms;
     Ok(ProcessInfo {
         process_id: process_id.to_string(),
         remote_root,
@@ -761,7 +772,23 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
         available_from_seq,
         truncated: output.truncated,
         output_retained: true,
+        status,
+        pid,
+        elapsed_ms,
+        last_output_at_unix_ms,
     })
+}
+
+fn compute_process_status(exit_code: Option<i32>, failure: Option<&str>) -> String {
+    if exit_code.is_some() {
+        if exit_code == Some(0) && failure.is_none() {
+            "exited".to_string()
+        } else {
+            "failed".to_string()
+        }
+    } else {
+        "running".to_string()
+    }
 }
 
 pub(super) fn spawn_maintenance_task(state: Arc<ServerState>) {
@@ -1033,6 +1060,7 @@ fn spawn_reader<R>(
                     let mut target = output.lock().await;
                     let data = local[..n].to_vec();
                     target.total_bytes += data.len();
+                    target.last_output_at_unix_ms = Some(unix_now_ms());
                     let seq = target.next_seq;
                     target.next_seq += 1;
                     target.chunks.push(OutputChunk {

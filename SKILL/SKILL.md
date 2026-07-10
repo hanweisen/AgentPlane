@@ -227,6 +227,7 @@ Use the CLI directly for:
 - `process-start`
 - `process-run`
 - `process-read`
+- `process-status`
 - `process-get`
 - `process-list`
 - `process-write`
