@@ -546,6 +546,18 @@ struct ProcessCleanupArgs {
     json: bool,
     #[arg(long = "text", default_value_t = false)]
     text: bool,
+    #[arg(
+        long = "reconfirm",
+        default_value_t = false,
+        help = "After --kill, poll the matching processes again and report which signaled processes are still alive."
+    )]
+    reconfirm: bool,
+    #[arg(
+        long = "reconfirm-wait-ms",
+        default_value_t = 2000,
+        help = "Upper bound for the --reconfirm settle window before reporting survivors."
+    )]
+    reconfirm_wait_ms: u64,
 }
 
 #[derive(Debug, Args)]

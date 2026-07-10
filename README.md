@@ -423,6 +423,22 @@ signal when `--kill --signal TERM|KILL` is explicit.
   --text
 ```
 
+Add `--reconfirm` to a `--kill` run so the client polls the matcher again afterwards and reports
+which signaled processes are still alive, instead of requiring a separate `--dry-run` to check.
+The settle window is bounded by `--reconfirm-wait-ms` (default 2000). The JSON output gains a
+`remaining` array (subset of `signaled` still matched) and `reconfirm_ok` (`remaining` is empty);
+text mode prints a `Reconfirm:` verdict line.
+
+```bash
+./agentplane process-cleanup \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --match 'service-name|worker-name' \
+  --kill \
+  --signal TERM \
+  --reconfirm
+```
+
 ### File Operations
 
 Write a text file:

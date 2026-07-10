@@ -470,6 +470,143 @@ fn cli_process_cleanup_dry_run_and_explicit_term_signal() -> Result<()> {
     result
 }
 
+#[test]
+fn cli_process_cleanup_reconfirm_reports_no_survivors_after_term() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+    let marker = format!("cc_reconfirm_marker_{}", std::process::id());
+    let mut child = Command::new("python3")
+        .args(["-c", "import time; time.sleep(30)", &marker])
+        .spawn()?;
+    let child_pid = child.id() as i64;
+
+    let result = (|| -> Result<()> {
+        // Wait for the matcher to see the process before killing it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let dry_run = run_cli(&[
+                "process-cleanup",
+                "--server",
+                &harness.base_url,
+                "--token",
+                token,
+                "--match",
+                &marker,
+                "--dry-run",
+            ])?;
+            let body: serde_json::Value = serde_json::from_slice(&dry_run.stdout)?;
+            if body["matched"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|process| process["pid"].as_i64() == Some(child_pid))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let killed = run_cli(&[
+            "process-cleanup",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--match",
+            &marker,
+            "--kill",
+            "--signal",
+            "TERM",
+            "--reconfirm",
+        ])?;
+        assert!(
+            killed.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&killed.stderr)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&killed.stdout)?;
+        assert_eq!(body["dry_run"], false);
+        assert_eq!(body["signal"], "TERM");
+        assert!(
+            body["signaled"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|process| process["pid"].as_i64() == Some(child_pid)),
+            "signaled list missing pid {child_pid}: {body}"
+        );
+        // The closed loop should observe the signaled process exit within the
+        // settle window and report no survivors.
+        assert_eq!(body["reconfirm_ok"], true, "reconfirm_ok not true: {body}");
+        assert!(
+            body["remaining"].as_array().unwrap().is_empty(),
+            "remaining not empty: {body}"
+        );
+
+        // Text mode prints the closed-loop verdict.
+        let mut text_child = Command::new("python3")
+            .args(["-c", "import time; time.sleep(30)", &marker, "text"])
+            .spawn()?;
+        let text_pid = text_child.id() as i64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let dry_run = run_cli(&[
+                "process-cleanup",
+                "--server",
+                &harness.base_url,
+                "--token",
+                token,
+                "--match",
+                &marker,
+                "--dry-run",
+            ])?;
+            let body: serde_json::Value = serde_json::from_slice(&dry_run.stdout)?;
+            if body["matched"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|process| process["pid"].as_i64() == Some(text_pid))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let killed_text = run_cli(&[
+            "process-cleanup",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--match",
+            &marker,
+            "--kill",
+            "--signal",
+            "TERM",
+            "--reconfirm",
+            "--text",
+        ])?;
+        assert!(
+            killed_text.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&killed_text.stderr)
+        );
+        let text = String::from_utf8(killed_text.stdout)?;
+        assert!(
+            text.contains("Reconfirm: all signaled processes exited."),
+            "text: {text}"
+        );
+        wait_for_child_exit(&mut text_child)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
 #[tokio::test]
 async fn process_read_supports_sequence_cursor_wait_and_binary_output() -> Result<()> {
     let remote_root = tempfile::tempdir()?;
