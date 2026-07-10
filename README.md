@@ -414,11 +414,15 @@ Upload a large local file in chunks with resume support:
   --remote-root "$AP_REMOTE_ROOT" \
   --path models/weights.bin \
   --from-local ./models/weights.bin \
-  --chunk-size 4194304 \
+  --chunk-size 1048576 \
   --atomic \
   --checksum sha256:<hex> \
   --resume
 ```
+
+The default `--chunk-size` is 1048576 bytes (1 MiB), which stays under the
+server's default request body limit. Each chunk is base64-encoded in a JSON
+payload, so choose a smaller `--chunk-size` when a gateway imposes its own limit.
 
 Use `--lock-key <KEY>` when multiple agents may upload the same logical artifact and should
 fail fast instead of racing on the same target. If the client dies mid-upload, rerun with
@@ -476,7 +480,8 @@ Wait until devices are stably idle:
 ```
 
 `accelerator-status`, `accelerator-preflight`, and `accelerator-wait-idle` are the generic
-forms. The current built-in provider is NVIDIA GPU through `nvidia-smi`.
+forms. Built-in providers are NVIDIA GPU through `nvidia-smi` and Huawei Ascend NPU through
+`npu-smi`; use `npu-status` as the NPU status shortcut.
 
 ### Shared Agent Mode
 

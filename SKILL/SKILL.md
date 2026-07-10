@@ -1,6 +1,6 @@
 ---
 name: agentplane
-description: Operate a remote machine, container, or shared workspace for build, test, inference, file editing, long-lived process sessions, and optional multi-agent GPU lease workflows via `agentplane`. Use this when the workflow is "edit locally, run remotely" against either a direct AgentPlane server or a path-based gateway URL that also requires custom gateway headers.
+description: Operate a remote machine, container, or shared workspace for build, test, inference, file editing, long-lived process sessions, and optional multi-agent lease-backed resource claims via `agentplane`. Use this when the workflow is "edit locally, run remotely" against either a direct AgentPlane server or a path-based gateway URL that also requires custom gateway headers.
 ---
 
 # AgentPlane
@@ -19,7 +19,7 @@ This skill supports two **access modes**. Pick exactly one before any remote ope
 Access mode is separate from execution mode:
 
 - access mode: `direct` or `gateway`
-- execution mode: default single-agent, or optional shared mode with GPU leases
+- execution mode: default single-agent, or optional shared mode with lease-backed resource claims
 
 Prefer terminal commands and direct HTTP. Do not use browser automation unless the user
 explicitly asks for it.
@@ -181,6 +181,7 @@ They apply to safe requests such as:
 - `health`
 - `accelerator-status`
 - `gpu-status`
+- `npu-status`
 - `accelerator-preflight`
 - `gpu-preflight`
 - `accelerator-wait-idle`
@@ -218,6 +219,7 @@ Use the CLI directly for:
 - `sync-run`
 - `accelerator-status`
 - `gpu-status`
+- `npu-status`
 - `accelerator-preflight`
 - `gpu-preflight`
 - `accelerator-wait-idle`
@@ -409,18 +411,23 @@ request stays bounded and interrupted transfers can resume:
   --remote-root "$AP_REMOTE_ROOT" \
   --path models/weights.bin \
   --from-local ./models/weights.bin \
-  --chunk-size 4194304 \
+  --chunk-size 1048576 \
   --atomic \
   --checksum sha256:<hex> \
   --resume
 ```
 
+The default `file-upload --chunk-size` is 1048576 bytes (1 MiB), which stays
+under the server's default request body limit. Each chunk is base64-encoded in
+a JSON payload, so pass a smaller `--chunk-size` when a gateway imposes its own
+per-request limit.
+
 ### Accelerator status
 
 `agentplane` treats accelerator inspection as a generic module. Use
-`accelerator-status --kind gpu` for the generic entrypoint, or `gpu-status` as the GPU
-shortcut. The first implemented provider is NVIDIA through `nvidia-smi`; NPU providers are
-future extensions.
+`accelerator-status --kind gpu` or `accelerator-status --kind npu` for the generic
+entrypoint. `gpu-status` and `npu-status` are shortcuts. Built-in providers are NVIDIA GPU
+through `nvidia-smi` and Huawei Ascend NPU through `npu-smi`.
 
 Probe at most once per container session to establish whether GPU hardware exists unless
 the user says the environment changed:
@@ -432,6 +439,12 @@ the user says the environment changed:
   --kind gpu
 
 "$AP_BIN" gpu-status \
+  --server "$AP_SERVER" \
+  --token "$AP_TOKEN" \
+  --gpus 0-7 \
+  --text
+
+"$AP_BIN" npu-status \
   --server "$AP_SERVER" \
   --token "$AP_TOKEN" \
   --gpus 0-7 \
@@ -467,7 +480,8 @@ over hand-parsing `gpu-status` JSON:
 above threshold, metrics are unavailable, or a compute process command matches the
 case-insensitive `--forbid-match` regex. Failure output identifies the GPU, PID, command,
 and threshold that blocked startup. Use `accelerator-preflight --kind gpu` when you want the
-generic accelerator entrypoint.
+generic accelerator entrypoint; use `accelerator-preflight --kind npu` for NPU readiness
+checks.
 
 After stopping wrappers, profilers, or model servers, prefer `gpu-wait-idle` before the next
 run:
@@ -487,9 +501,9 @@ run:
 `gpu-wait-idle` loops over GPU status until all selected GPUs stay within thresholds for
 `--stable-seconds`. It exits non-zero on timeout and includes the last GPU/process snapshot
 so the blocking PID and command are visible. Use `accelerator-wait-idle --kind gpu` for the
-generic accelerator form. If `gpu-status` has already returned `available:false` in the
-same container session, do not call these GPU readiness helpers unless the user says the
-environment changed.
+generic accelerator form, or `accelerator-wait-idle --kind npu` for NPU. If `gpu-status` or
+`npu-status` has already returned `available:false` in the same container session, do not
+call those readiness helpers again unless the user says the environment changed.
 
 ### Shared mode and lease-backed resource claims
 

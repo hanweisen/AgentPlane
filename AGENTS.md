@@ -79,3 +79,163 @@ For Linux container release builds from macOS, follow the README's cross-build c
 and keep `CARGO_HOME` and `CARGO_TARGET_DIR` pointed at the repo-local cache directories.
 
 If validation cannot be run, say exactly which checks were skipped and why.
+
+## MiniMax Subagent Validation Discipline
+
+When asking a MiniMax subagent to validate AgentPlane locally, give it a narrow, explicit
+script and require evidence for each step. The subagent must not broaden scope, redesign
+the feature, edit unrelated files, rebuild release artifacts, push code, or start remote
+machine work unless the prompt explicitly asks for that.
+
+If a MiniMax subagent cannot complete a requested step immediately because a command,
+dependency, port, permission, or environment value is missing, it must stop and report the
+exact blocker, command output, and the last successful step. It should not guess tokens,
+scan ports, change ports repeatedly, or keep trying unrelated alternatives.
+
+For upload or sync validation, the subagent must record:
+
+- server command, PID, and log paths
+- exact client command
+- effective `--chunk-size` or `--upload-chunk-size`
+- HTTP status or CLI exit code
+- SHA-256 before and after transfer when file contents matter
+- whether any 413 response is JSON from AgentPlane or HTML from an upstream gateway/proxy
+
+## Release Builds From macOS
+
+Build release artifacts from macOS with the rustup toolchain binaries and Zig wrappers.
+Keep build caches repo-local and untracked. Do not commit `dist/`, `.cargo-home*`, or
+`.cargo-target*` unless the task explicitly asks for release artifacts.
+
+Prerequisites:
+
+```bash
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin
+command -v /opt/homebrew/bin/zig
+```
+
+Create Zig compiler wrappers before Linux builds. The wrappers deliberately remove
+`--target=<rust-triple>` arguments that `cc-rs`, `ring`, or `aws-lc-sys` may add, because
+Zig expects targets like `aarch64-linux-gnu` instead of `aarch64-unknown-linux-gnu`.
+
+```bash
+cat > /tmp/zigcc-x86_64-linux-gnu <<'EOF'
+#!/bin/bash
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --target=x86_64-unknown-linux-gnu|-target=x86_64-unknown-linux-gnu) ;;
+    *) args+=("$arg") ;;
+  esac
+done
+exec /opt/homebrew/bin/zig cc -target x86_64-linux-gnu "${args[@]}"
+EOF
+
+cat > /tmp/zigcxx-x86_64-linux-gnu <<'EOF'
+#!/bin/bash
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --target=x86_64-unknown-linux-gnu|-target=x86_64-unknown-linux-gnu) ;;
+    *) args+=("$arg") ;;
+  esac
+done
+exec /opt/homebrew/bin/zig c++ -target x86_64-linux-gnu "${args[@]}"
+EOF
+
+cat > /tmp/zigcc-aarch64-linux-gnu <<'EOF'
+#!/bin/bash
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --target=aarch64-unknown-linux-gnu|-target=aarch64-unknown-linux-gnu) ;;
+    *) args+=("$arg") ;;
+  esac
+done
+exec /opt/homebrew/bin/zig cc -target aarch64-linux-gnu "${args[@]}"
+EOF
+
+cat > /tmp/zigcxx-aarch64-linux-gnu <<'EOF'
+#!/bin/bash
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --target=aarch64-unknown-linux-gnu|-target=aarch64-unknown-linux-gnu) ;;
+    *) args+=("$arg") ;;
+  esac
+done
+exec /opt/homebrew/bin/zig c++ -target aarch64-linux-gnu "${args[@]}"
+EOF
+
+cat > /tmp/zigar <<'EOF'
+#!/bin/sh
+exec /opt/homebrew/bin/zig ar "$@"
+EOF
+
+chmod +x /tmp/zigcc-x86_64-linux-gnu /tmp/zigcxx-x86_64-linux-gnu \
+  /tmp/zigcc-aarch64-linux-gnu /tmp/zigcxx-aarch64-linux-gnu /tmp/zigar
+```
+
+Build all three targets:
+
+```bash
+CARGO_HOME=$PWD/.cargo-home-local \
+CARGO_TARGET_DIR=$PWD/.cargo-target-linux-x86_64 \
+RUSTC=/Users/hanweisen/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/tmp/zigcc-x86_64-linux-gnu \
+CC_x86_64_unknown_linux_gnu=/tmp/zigcc-x86_64-linux-gnu \
+CXX_x86_64_unknown_linux_gnu=/tmp/zigcxx-x86_64-linux-gnu \
+AR_x86_64_unknown_linux_gnu=/tmp/zigar \
+/Users/hanweisen/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo \
+  build --release --target x86_64-unknown-linux-gnu
+
+CARGO_HOME=$PWD/.cargo-home-local \
+CARGO_TARGET_DIR=$PWD/.cargo-target-linux-aarch64 \
+RUSTC=/Users/hanweisen/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/tmp/zigcc-aarch64-linux-gnu \
+CC_aarch64_unknown_linux_gnu=/tmp/zigcc-aarch64-linux-gnu \
+CXX_aarch64_unknown_linux_gnu=/tmp/zigcxx-aarch64-linux-gnu \
+AR_aarch64_unknown_linux_gnu=/tmp/zigar \
+/Users/hanweisen/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo \
+  build --release --target aarch64-unknown-linux-gnu
+
+CARGO_HOME=$PWD/.cargo-home-local \
+CARGO_TARGET_DIR=$PWD/.cargo-target-macos \
+RUSTC=/Users/hanweisen/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
+/Users/hanweisen/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo \
+  build --release --target aarch64-apple-darwin
+```
+
+Package the artifacts:
+
+```bash
+rm -rf dist/agentplane-linux-x86_64 dist/agentplane-linux-aarch64 dist/agentplane-macos-arm64
+mkdir -p dist/agentplane-linux-x86_64 dist/agentplane-linux-aarch64 dist/agentplane-macos-arm64
+cp .cargo-target-linux-x86_64/x86_64-unknown-linux-gnu/release/agentplane \
+  dist/agentplane-linux-x86_64/agentplane
+cp .cargo-target-linux-aarch64/aarch64-unknown-linux-gnu/release/agentplane \
+  dist/agentplane-linux-aarch64/agentplane
+cp .cargo-target-macos/aarch64-apple-darwin/release/agentplane \
+  dist/agentplane-macos-arm64/agentplane
+cp README.md dist/agentplane-linux-x86_64/README.md
+cp README.md dist/agentplane-linux-aarch64/README.md
+cp README.md dist/agentplane-macos-arm64/README.md
+chmod 755 dist/agentplane-linux-x86_64/agentplane \
+  dist/agentplane-linux-aarch64/agentplane \
+  dist/agentplane-macos-arm64/agentplane
+tar -C dist -czf dist/agentplane-linux-x86_64.tar.gz agentplane-linux-x86_64
+tar -C dist -czf dist/agentplane-linux-aarch64.tar.gz agentplane-linux-aarch64
+tar -C dist -czf dist/agentplane-macos-arm64.tar.gz agentplane-macos-arm64
+```
+
+Verify release artifacts:
+
+```bash
+file dist/agentplane-linux-x86_64/agentplane \
+  dist/agentplane-linux-aarch64/agentplane \
+  dist/agentplane-macos-arm64/agentplane
+shasum -a 256 dist/agentplane-*.tar.gz
+tar -tzf dist/agentplane-linux-x86_64.tar.gz | sed -n '1,5p'
+tar -tzf dist/agentplane-linux-aarch64.tar.gz | sed -n '1,5p'
+tar -tzf dist/agentplane-macos-arm64.tar.gz | sed -n '1,5p'
+```

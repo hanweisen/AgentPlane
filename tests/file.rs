@@ -1083,3 +1083,87 @@ fn cli_file_stat_and_wait_cover_min_bytes_stable_and_timeout() -> Result<()> {
     assert!(timeout_stderr.contains("\"file_type\": \"missing\""));
     Ok(())
 }
+
+#[test]
+fn cli_file_upload_default_chunk_size_handles_large_file() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    // A file larger than 2 MiB so that the old 4 MiB default chunk (base64-encoded
+    // inside a JSON payload) would exceed the Axum default body limit and fail.
+    let local_upload = remote_root.path().join("default-chunk-upload.bin");
+    let pattern = b"0123456789abcdef0123456789abcdef";
+    let content = pattern.repeat(3 * 1024 * 1024 / pattern.len() + 1);
+    let content = content[..3 * 1024 * 1024].to_vec();
+    std::fs::write(&local_upload, &content)?;
+    let checksum = test_sha256_hex(&content);
+
+    let file_upload = run_cli(&[
+        "file-upload",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--path",
+        "nested/default-chunk.bin",
+        "--from-local",
+        &local_upload.display().to_string(),
+        "--atomic",
+        "--checksum",
+        &format!("sha256:{checksum}"),
+        "--resume",
+        "--lock-key",
+        "nested/default-chunk.bin",
+    ])?;
+    assert!(
+        file_upload.status.success(),
+        "file-upload with default chunk size failed: {}",
+        String::from_utf8_lossy(&file_upload.stderr)
+    );
+
+    let file_stat = run_cli(&[
+        "file-stat",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--path",
+        "nested/default-chunk.bin",
+    ])?;
+    assert!(
+        file_stat.status.success(),
+        "file-stat failed: {}",
+        String::from_utf8_lossy(&file_stat.stderr)
+    );
+    let file_stat_body: serde_json::Value = serde_json::from_slice(&file_stat.stdout)?;
+    assert_eq!(file_stat_body["sha256"], checksum);
+
+    let file_read = run_cli(&[
+        "file-read",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--path",
+        "nested/default-chunk.bin",
+    ])?;
+    assert!(
+        file_read.status.success(),
+        "file-read failed: {}",
+        String::from_utf8_lossy(&file_read.stderr)
+    );
+    let file_read_body: serde_json::Value = serde_json::from_slice(&file_read.stdout)?;
+    assert_eq!(
+        decode_b64(file_read_body["content_b64"].as_str().unwrap_or_default())?,
+        String::from_utf8_lossy(&content)
+    );
+
+    Ok(())
+}

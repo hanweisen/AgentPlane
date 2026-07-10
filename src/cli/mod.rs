@@ -647,7 +647,7 @@ struct FileUploadArgs {
     path: String,
     #[arg(long = "from-local", value_name = "PATH")]
     from_local: PathBuf,
-    #[arg(long = "chunk-size", value_name = "BYTES", default_value_t = 4 * 1024 * 1024)]
+    #[arg(long = "chunk-size", value_name = "BYTES", default_value_t = 1024 * 1024)]
     chunk_size: usize,
     #[arg(long = "resume", default_value_t = false)]
     resume: bool,
