@@ -183,6 +183,10 @@ AP_REMOTE_ROOT='/workspace/project'
   --socks5-hostname 127.0.0.1:1086
 ```
 
+When a request fails to connect or times out while `--socks5-hostname` (or `AP_SOCKS5_HOSTNAME`)
+is set, the error names the configured proxy address and reminds you to verify it is listening
+and reachable, so a typo'd proxy port is obvious instead of looking like a server problem.
+
 For HTTPS with a self-signed certificate, start the server with:
 
 ```bash
@@ -337,6 +341,10 @@ If a network request times out, retry `process-start` with the same `--process-i
 same arguments. AgentPlane will reconnect to the existing process instead of starting a
 duplicate command.
 
+If `process-read` cannot find a `--process-id` (for example, after a restart loses the id), the
+error output includes a `hint:` pointing at `process-status`, which lists the most recently
+active processes so you can recover the id instead of guessing.
+
 Use `process-start` for long-running producers, samplers, servers, and benchmarks that
 should keep running while you do other work. Use `process-run` for short build/check
 commands and consumers/drivers where the local exit code should match the remote command.
@@ -357,6 +365,11 @@ code as the local exit code:
   -- \
   bash -lc 'cargo check'
 ```
+
+When the remote command exits non-zero, `--tail-on-error <BYTES>` prints the last retained
+output bytes to stderr. Add `--tail-on-error-head-bytes <BYTES>` (default 512) to also print
+the earliest retained bytes first, so the banner/env context that a tail-only view loses stays
+visible; set `0` to disable the head.
 
 ### Check Long-Running Task Status
 
@@ -520,8 +533,13 @@ Wait for generated output:
   --path reports/result.json \
   --min-bytes 1 \
   --stable-ms 1000 \
-  --timeout-seconds 300
+  --timeout-seconds 300 \
+  --process-id build-1
 ```
+
+On timeout, `file-wait` prints the last observed path state (exists/size/modified time) to
+stderr. With `--process-id <ID>` it also probes that producer process and reports its status,
+exit code, and whether it is still alive, so you can tell a dead producer from a slow one.
 
 ### GPU Readiness
 

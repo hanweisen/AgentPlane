@@ -1407,3 +1407,100 @@ fn cli_file_copy_rejects_missing_source_and_escaping_destination() -> Result<()>
 
     Ok(())
 }
+
+#[test]
+fn cli_file_wait_timeout_hint_reports_state_and_producer() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    // Start a producer that writes slowly: it is still alive when the wait
+    // times out, so the producer hint should report status=running/exited=false.
+    let _started = run_cli(&[
+        "process-start",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--process-id",
+        "slow-producer",
+        "--output-bytes-limit",
+        "1048576",
+        "--",
+        "bash",
+        "-lc",
+        "sleep 30",
+    ])?;
+
+    let timeout = run_cli(&[
+        "file-wait",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--path",
+        "never-appears.txt",
+        "--timeout-seconds",
+        "1",
+        "--process-id",
+        "slow-producer",
+    ])?;
+    assert_eq!(timeout.status.code(), Some(1));
+    let stderr = String::from_utf8(timeout.stderr)?;
+    assert!(
+        stderr.contains("file-wait timed out after 1 seconds"),
+        "missing timeout banner: {stderr}"
+    );
+    assert!(
+        stderr.contains("hint: path never-appears.txt exists=false"),
+        "missing actionable hint: {stderr}"
+    );
+    assert!(
+        stderr.contains("modified_unix_ms=0"),
+        "missing mtime in hint: {stderr}"
+    );
+    assert!(
+        stderr.contains("producer 'slow-producer' status="),
+        "missing producer hint: {stderr}"
+    );
+    assert!(
+        stderr.contains("exited=false"),
+        "producer should be reported alive: {stderr}"
+    );
+
+    // No --process-id: nudge the caller instead.
+    let timeout_no_pid = run_cli(&[
+        "file-wait",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--path",
+        "also-never.txt",
+        "--timeout-seconds",
+        "1",
+    ])?;
+    assert_eq!(timeout_no_pid.status.code(), Some(1));
+    let stderr_no_pid = String::from_utf8(timeout_no_pid.stderr)?;
+    assert!(
+        stderr_no_pid.contains("--process-id to report whether the producer"),
+        "missing --process-id nudge: {stderr_no_pid}"
+    );
+
+    let _ = run_cli(&[
+        "process-terminate",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "slow-producer",
+    ])?;
+    Ok(())
+}

@@ -64,3 +64,31 @@ fn cli_health_profile_label_surfaces_in_output() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn cli_health_socks_failure_hints_at_proxy() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    // A SOCKS proxy on a port nothing listens on forces a connect error. The
+    // error must surface the configured proxy address so the agent can check it.
+    let health = run_cli(&[
+        "health",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--socks5-hostname",
+        "127.0.0.1:1",
+        "--connect-retries",
+        "0",
+    ])?;
+    assert!(!health.status.success());
+    let stderr = String::from_utf8(health.stderr)?;
+    assert!(
+        stderr.contains("127.0.0.1:1") && stderr.contains("SOCKS proxy"),
+        "missing SOCKS hint in error: {stderr}"
+    );
+    Ok(())
+}

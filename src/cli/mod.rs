@@ -451,6 +451,13 @@ struct ProcessRunArgs {
         help = "When the remote command exits non-zero, print the last retained output bytes to stderr."
     )]
     tail_on_error: Option<usize>,
+    #[arg(
+        long = "tail-on-error-head-bytes",
+        value_name = "BYTES",
+        default_value_t = 512,
+        help = "With --tail-on-error, also print this many of the earliest retained output bytes (env/banner context) before the tail. Set 0 to disable."
+    )]
+    tail_on_error_head_bytes: usize,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     command: Vec<String>,
 }
@@ -661,6 +668,11 @@ struct FileWaitArgs {
     stable_ms: Option<u64>,
     #[arg(long = "timeout-seconds", default_value_t = 60)]
     timeout_seconds: u64,
+    #[arg(
+        long = "process-id",
+        help = "Producer process to report on timeout. When set, the timeout hint includes its status/exit code."
+    )]
+    process_id: Option<String>,
 }
 
 #[derive(Debug, Args)]

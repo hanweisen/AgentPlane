@@ -21,7 +21,8 @@ use crate::protocol::{
     FileDeleteRequest, FileFindRequest, FileListRequest, FileReadRequest, FileReadResponse,
     FileStatRequest, FileStatResponse, FileUploadChunkRequest, FileUploadChunkResponse,
     FileUploadFinishRequest, FileUploadInitRequest, FileUploadInitResponse,
-    FileUploadStatusRequest, FileUploadStatusResponse, FileWriteRequest, SimpleResponse,
+    FileUploadStatusRequest, FileUploadStatusResponse, FileWriteRequest, ProcessGetRequest,
+    SimpleResponse,
 };
 
 use super::sync_session::{acquire_sync_session, release_sync_session};
@@ -111,15 +112,60 @@ pub(super) async fn file_wait(args: FileWaitArgs, profile: &ClientProfile) -> Re
 
         let now = Instant::now();
         if now >= deadline {
+            let producer = file_wait_producer_hint(&auth, args.process_id.as_deref()).await;
             eprintln!(
                 "file-wait timed out after {} seconds; last observed state:",
                 args.timeout_seconds
             );
             eprintln!("{}", serde_json::to_string_pretty(&stat)?);
+            eprintln!(
+                "hint: path {} exists={} size={} modified_unix_ms={}; {producer}",
+                payload.path,
+                stat.exists,
+                stat.size.unwrap_or(0),
+                stat.modified_unix_ms.unwrap_or(0),
+            );
             return Ok(ExitCode::from(1));
         }
         let remaining = deadline.saturating_duration_since(now);
         tokio::time::sleep(remaining.min(Duration::from_millis(FILE_WAIT_POLL_MS))).await;
+    }
+}
+
+/// One-line summary of the producer process for the file-wait timeout hint.
+/// When no `--process-id` is supplied, nudge the caller to provide one; when one
+/// is supplied, report whether it is still alive so the agent can tell a dead
+/// producer from a slow one.
+async fn file_wait_producer_hint(auth: &ResolvedClientAuth, process_id: Option<&str>) -> String {
+    let Some(process_id) = process_id else {
+        return "pass --process-id to report whether the producer is still alive".to_string();
+    };
+    let payload = ProcessGetRequest {
+        process_id: process_id.to_string(),
+    };
+    let response = match post_json(auth, "/v1/process/get", &payload, true).await {
+        Ok(response) => response,
+        Err(error) => {
+            return format!("producer '{process_id}' status=unknown (failed to probe: {error:#})");
+        }
+    };
+    if response.status() != StatusCode::OK {
+        return format!("producer '{process_id}' not found (no longer running)");
+    }
+    match response.json::<serde_json::Value>().await {
+        Ok(body) => {
+            let status = body["process"]["status"].as_str().unwrap_or("unknown");
+            let exited = body["process"]["exited"].as_bool().unwrap_or(false);
+            match body["process"]["exit_code"].as_i64() {
+                Some(code) => {
+                    format!(
+                        "producer '{process_id}' status={status} exited={exited} exit_code={code}"
+                    )
+                }
+                None => format!("producer '{process_id}' status={status} exited={exited}"),
+            }
+        }
+        Err(_) => format!("producer '{process_id}' status=unknown (could not decode response)"),
     }
 }
 

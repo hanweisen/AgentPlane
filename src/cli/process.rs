@@ -9,7 +9,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::StatusCode;
 
 use crate::cli_client::{
-    post_json, post_process_start_with_recovery, print_error_response, process_error_response,
+    emit_error_body, post_json, post_process_start_with_recovery, print_error_response,
+    process_error_response,
 };
 use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
 use crate::protocol::{
@@ -267,6 +268,7 @@ pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -
                     &args.process_id,
                     body.available_from_seq,
                     bytes,
+                    args.tail_on_error_head_bytes,
                 )
                 .await?;
             }
@@ -298,7 +300,7 @@ pub(super) async fn process_read(
         .await
     } else {
         let payload = ProcessReadRequest {
-            process_id: args.process_id,
+            process_id: args.process_id.clone(),
             after_seq,
             max_bytes: args.max_bytes,
             wait_ms: args.wait_ms,
@@ -309,8 +311,27 @@ pub(super) async fn process_read(
             println!("{}", serde_json::to_string_pretty(&body)?);
             return Ok(ExitCode::SUCCESS);
         }
-        print_error_response(response).await
+        print_process_read_error(response, &args.process_id, &auth.server).await
     }
+}
+
+/// Print a process-read failure. When the server reports the process_id is
+/// unknown, append an actionable hint pointing at `process-status` so the agent
+/// can recover a lost id instead of guessing.
+async fn print_process_read_error(
+    response: reqwest::Response,
+    process_id: &str,
+    server: &str,
+) -> Result<ExitCode> {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    emit_error_body(status, &text)?;
+    if status == StatusCode::BAD_REQUEST && text.contains("unknown process_id") {
+        eprintln!(
+            "hint: process '{process_id}' was not found on {server}; list recent processes with `agentplane process-status --server {server} --token <token>`"
+        );
+    }
+    Ok(ExitCode::from(1))
 }
 
 pub(super) async fn process_get(args: ProcessGetArgs, profile: &ClientProfile) -> Result<ExitCode> {
@@ -572,7 +593,7 @@ async fn process_read_loop(
         };
         let response = post_json(&auth, "/v1/process/read", &payload, true).await?;
         if response.status() != StatusCode::OK {
-            return print_error_response(response).await;
+            return print_process_read_error(response, &process_id, &auth.server).await;
         }
         let body: ProcessReadResponse = response.json().await?;
         warn_if_cursor_expired(&body, None);
@@ -613,10 +634,38 @@ async fn print_process_tail_on_error(
     process_id: &str,
     available_from_seq: u64,
     tail_bytes: usize,
+    head_bytes: usize,
 ) -> Result<()> {
     if tail_bytes == 0 {
         return Ok(());
     }
+    let mut err = io::stderr();
+
+    // Head: the earliest retained bytes give env/banner context that a tail-only
+    // view loses. Read from available_from_seq (the oldest chunk still held by the
+    // server) so this stays correct even when the true start was evicted.
+    if head_bytes > 0 {
+        let head = read_process_head(auth, process_id, available_from_seq, head_bytes).await?;
+        if !head.is_empty() {
+            let label = if available_from_seq > 0 {
+                format!(
+                    "[agentplane] tail-on-error: earliest {} retained output bytes (output was truncated, true start evicted):",
+                    head.len()
+                )
+            } else {
+                format!(
+                    "[agentplane] tail-on-error: first {} output bytes:",
+                    head.len()
+                )
+            };
+            writeln!(err, "{label}")?;
+            err.write_all(&head)?;
+            if !head.ends_with(b"\n") {
+                writeln!(err)?;
+            }
+        }
+    }
+
     let mut after_seq = Some(available_from_seq);
     let max_bytes = Some(tail_bytes.clamp(1, 1024 * 1024));
     let mut retained = Vec::new();
@@ -635,7 +684,6 @@ async fn print_process_tail_on_error(
         }
     }
     if !retained.is_empty() {
-        let mut err = io::stderr();
         writeln!(
             err,
             "[agentplane] tail-on-error: last {} retained output bytes follow:",
@@ -645,9 +693,37 @@ async fn print_process_tail_on_error(
         if !retained.ends_with(b"\n") {
             writeln!(err)?;
         }
-        err.flush()?;
     }
+    err.flush()?;
     Ok(())
+}
+
+/// Read up to `head_bytes` of the earliest retained output starting at
+/// `available_from_seq`. Returns at most `head_bytes` bytes.
+async fn read_process_head(
+    auth: &ResolvedClientAuth,
+    process_id: &str,
+    available_from_seq: u64,
+    head_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut after_seq = Some(available_from_seq);
+    let max_bytes = Some(head_bytes.clamp(1, 1024 * 1024));
+    for _ in 0..1_000 {
+        let body = read_process_once(auth, process_id, after_seq, max_bytes, None).await?;
+        append_process_chunk_bytes(&body, &mut head)?;
+        if head.len() >= head_bytes {
+            head.truncate(head_bytes);
+            break;
+        }
+        let previous = after_seq;
+        after_seq = Some(body.next_seq);
+        if body.exited || after_seq == previous {
+            break;
+        }
+    }
+    head.truncate(head_bytes);
+    Ok(head)
 }
 
 fn append_process_chunk_bytes(body: &ProcessReadResponse, target: &mut Vec<u8>) -> Result<()> {

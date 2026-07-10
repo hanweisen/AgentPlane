@@ -23,8 +23,13 @@ pub(super) async fn health(args: HealthArgs, profile: &ClientProfile) -> Result<
     let mut headers = profile.headers.clone();
     headers.extend(args.header.clone());
     let token = args.token.clone();
+    let socks5_hostname = args
+        .socks5_hostname
+        .as_deref()
+        .or(profile.socks5_hostname.as_deref());
     let response = send_with_retry(
         &server,
+        socks5_hostname,
         args.connect_retries
             .or(profile.connect_retries)
             .unwrap_or(DEFAULT_CONNECT_RETRIES),
@@ -36,9 +41,7 @@ pub(super) async fn health(args: HealthArgs, profile: &ClientProfile) -> Result<
             let client = build_http_client_from_tls(
                 args.request_timeout_seconds
                     .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECONDS),
-                args.socks5_hostname
-                    .as_deref()
-                    .or(profile.socks5_hostname.as_deref()),
+                socks5_hostname,
                 args.tls_ca_cert.as_ref(),
                 args.tls_insecure_skip_verify,
                 &headers,

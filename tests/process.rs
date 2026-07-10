@@ -2516,3 +2516,113 @@ fn cli_process_status_profile_label_surfaces_in_text_and_json() -> Result<()> {
     ])?;
     Ok(())
 }
+
+#[test]
+fn cli_process_read_unknown_id_hints_at_process_status() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    let read = run_cli(&[
+        "process-read",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "never-started",
+    ])?;
+    assert!(!read.status.success());
+    let stderr = String::from_utf8(read.stderr)?;
+    assert!(
+        stderr.contains("hint: process 'never-started' was not found"),
+        "missing not-found hint: {stderr}"
+    );
+    assert!(
+        stderr.contains("process-status --server"),
+        "missing process-status suggestion: {stderr}"
+    );
+
+    // The follow/text loop path produces the same hint.
+    let read_follow = run_cli(&[
+        "process-read",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--process-id",
+        "never-started",
+        "--text",
+        "--follow",
+        "--wait-ms",
+        "0",
+    ])?;
+    assert!(!read_follow.status.success());
+    let stderr_follow = String::from_utf8(read_follow.stderr)?;
+    assert!(
+        stderr_follow.contains("hint: process 'never-started' was not found"),
+        "missing not-found hint in follow path: {stderr_follow}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_process_run_tail_on_error_includes_head_and_tail() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    let run = run_cli(&[
+        "process-run",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--process-id",
+        "tail-head",
+        "--output-bytes-limit",
+        "1048576",
+        "--tail-on-error",
+        "64",
+        "--tail-on-error-head-bytes",
+        "32",
+        "--wait-ms",
+        "2000",
+        "--",
+        "bash",
+        "-lc",
+        "printf 'ENV-BANNER-HEAD\\n'; for i in $(seq 1 200); do printf 'line %d\\n' \"$i\"; done; exit 7",
+    ])?;
+    assert_eq!(run.status.code(), Some(7));
+    let stderr = String::from_utf8(run.stderr)?;
+    assert!(
+        stderr.contains("[agentplane] tail-on-error: first"),
+        "missing head label: {stderr}"
+    );
+    assert!(
+        stderr.contains("ENV-BANNER-HEAD"),
+        "head content missing from stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("[agentplane] tail-on-error: last"),
+        "missing tail label: {stderr}"
+    );
+    assert!(
+        stderr.contains("line 200"),
+        "tail content missing from stderr: {stderr}"
+    );
+    // The head must end before the tail begins (head is the earliest bytes).
+    let head_idx = stderr
+        .find("[agentplane] tail-on-error: first")
+        .expect("head label present");
+    let tail_idx = stderr
+        .find("[agentplane] tail-on-error: last")
+        .expect("tail label present");
+    assert!(
+        head_idx < tail_idx,
+        "head should print before tail: {stderr}"
+    );
+    Ok(())
+}

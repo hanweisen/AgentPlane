@@ -37,6 +37,7 @@ pub(crate) async fn post_json_with_client<T: serde::Serialize>(
     let authorization = format!("Bearer {}", auth.token);
     send_with_retry(
         &auth.server,
+        auth.socks5_hostname.as_deref(),
         auth.connect_retries,
         auth.connect_retry_delay_ms,
         retry_safe,
@@ -152,6 +153,7 @@ fn normalize_socks5_proxy_url(value: &str) -> Result<String> {
 
 pub(crate) async fn send_with_retry<F>(
     server: &str,
+    socks5_hostname: Option<&str>,
     connect_retries: usize,
     retry_delay_ms: u64,
     retry_safe: bool,
@@ -186,7 +188,7 @@ where
                     tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
                     continue;
                 }
-                return Err(wrap_request_error(error, server));
+                return Err(wrap_request_error(error, server, socks5_hostname));
             }
         }
     }
@@ -236,7 +238,15 @@ pub(crate) fn parse_extra_headers(extra_headers: &[String]) -> Result<HeaderMap>
 pub(crate) async fn print_error_response(response: reqwest::Response) -> Result<ExitCode> {
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
-    if let Ok(body) = serde_json::from_str::<SimpleResponse>(&text) {
+    emit_error_body(status, &text)?;
+    Ok(ExitCode::from(1))
+}
+
+/// Print a non-OK response body to stderr in the standard shape. Extracted from
+/// `print_error_response` so callers that want to add an actionable hint can
+/// reuse the body formatting after reading the response themselves.
+pub(crate) fn emit_error_body(status: StatusCode, text: &str) -> Result<()> {
+    if let Ok(body) = serde_json::from_str::<SimpleResponse>(text) {
         eprintln!("{}", serde_json::to_string(&body)?);
     } else {
         let mut message = format!(
@@ -248,17 +258,28 @@ pub(crate) async fn print_error_response(response: reqwest::Response) -> Result<
         }
         eprintln!("{}", message);
     }
-    Ok(ExitCode::from(1))
+    Ok(())
 }
 
-pub(crate) fn wrap_request_error(error: reqwest::Error, server: &str) -> anyhow::Error {
+pub(crate) fn wrap_request_error(
+    error: reqwest::Error,
+    server: &str,
+    socks5_hostname: Option<&str>,
+) -> anyhow::Error {
     let detail = format_error_chain(&error);
+    let socks_hint = socks5_hostname
+        .map(|proxy| {
+            format!(
+                " ; SOCKS proxy {proxy} is configured for this profile: verify it is listening and reachable"
+            )
+        })
+        .unwrap_or_default();
     if error.is_timeout() {
         anyhow!(
-            "request timed out for {server}; check http_proxy/https_proxy or network reachability: {detail}"
+            "request timed out for {server}; check http_proxy/https_proxy or network reachability: {detail}{socks_hint}"
         )
     } else if error.is_connect() {
-        anyhow!("failed to connect to {server}; check network reachability: {detail}")
+        anyhow!("failed to connect to {server}; check network reachability: {detail}{socks_hint}")
     } else {
         anyhow!("{detail}")
     }
