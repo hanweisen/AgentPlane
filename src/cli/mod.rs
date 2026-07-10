@@ -368,6 +368,11 @@ struct ProcessStartArgs {
     #[arg(long = "output-bytes-limit")]
     output_bytes_limit: Option<usize>,
     #[arg(
+        long = "save-output-path",
+        help = "Remote-root-relative path that receives the full stdout/stderr stream."
+    )]
+    save_output_path: Option<String>,
+    #[arg(
         long = "env",
         help = "Repeatable KEY=VALUE or KEY= pairs for the remote environment."
     )]
@@ -403,6 +408,11 @@ struct ProcessRunArgs {
     timeout_seconds: Option<u64>,
     #[arg(long = "output-bytes-limit")]
     output_bytes_limit: Option<usize>,
+    #[arg(
+        long = "save-output-path",
+        help = "Remote-root-relative path that receives the full stdout/stderr stream."
+    )]
+    save_output_path: Option<String>,
     #[arg(long = "max-bytes")]
     max_bytes: Option<usize>,
     #[arg(long = "wait-ms", default_value_t = 1000)]

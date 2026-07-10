@@ -307,6 +307,7 @@ mirror syncs:
   --process-id build-1 \
   --cwd "$AP_REMOTE_ROOT" \
   --output-bytes-limit 8388608 \
+  --save-output-path logs/build-1.log \
   -- \
   bash -lc 'cargo build --release'
 ```
@@ -327,6 +328,10 @@ Read output incrementally:
 If a network request times out, retry `process-start` with the same `--process-id` and the
 same arguments. AgentPlane will reconnect to the existing process instead of starting a
 duplicate command.
+
+For long jobs, add `--save-output-path <relative-path>` to `process-start` or
+`process-run` to keep a full stdout/stderr copy under the remote root even when the
+in-memory output buffer is truncated.
 
 For one-shot commands, `process-run` combines start/read/wait and returns the remote exit
 code as the local exit code:

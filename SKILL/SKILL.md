@@ -328,6 +328,7 @@ code to match the remote process, prefer `process-run`:
   --cwd "$AP_REMOTE_ROOT" \
   --timeout-seconds 1800 \
   --output-bytes-limit 8388608 \
+  --save-output-path logs/build-1.log \
   --tail-on-error 65536 \
   -- bash -lc 'make build'
 ```
@@ -336,8 +337,10 @@ code to match the remote process, prefer `process-run`:
 `process-read`. Use a stable `--process-id`; repeating the same command with the same
 configuration can reconnect to the existing process instead of starting duplicate work. Use
 `--tail-on-error <BYTES>` when failures should include the last retained output on stderr.
-If the CLI reports that the output cursor expired, earlier logs were already trimmed; rerun
-with a larger `--output-bytes-limit` or higher server output retention limits.
+For long jobs, add `--save-output-path <relative-path>` so the remote root keeps a full
+stdout/stderr copy even when the in-memory output buffer is trimmed. If the CLI reports that
+the output cursor expired and no save path was used, rerun with a larger
+`--output-bytes-limit` or higher server output retention limits.
 
 `process-read` and `file-read` return base64 by default. Prefer the CLI text helpers when
 available:

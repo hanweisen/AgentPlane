@@ -39,6 +39,7 @@ pub(super) async fn process_start(
         claims,
         timeout_seconds: args.timeout_seconds,
         output_bytes_limit: args.output_bytes_limit,
+        save_output_path: args.save_output_path,
         pipe_stdin: args.pipe_stdin,
         kill_tree_on_terminate: args.kill_tree_on_terminate,
     };
@@ -179,6 +180,10 @@ pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -
     let remote_root = resolve_remote_root(args.remote_root.as_ref(), profile)?;
     let env = parse_process_env_pairs(&args.env)?;
     let claims = parse_resource_claim_specs(&args.claims)?;
+    let save_output_path = args.save_output_path.clone();
+    let save_output_hint = save_output_path
+        .as_ref()
+        .map(|path| remote_root.join(path).display().to_string());
     let start_payload = ProcessStartRequest {
         remote_root: remote_root.display().to_string(),
         process_id: args.process_id.clone(),
@@ -188,6 +193,7 @@ pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -
         claims,
         timeout_seconds: args.timeout_seconds,
         output_bytes_limit: args.output_bytes_limit,
+        save_output_path: save_output_path.clone(),
         pipe_stdin: false,
         kill_tree_on_terminate: false,
     };
@@ -207,7 +213,7 @@ pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -
             Some(args.wait_ms),
         )
         .await?;
-        warn_if_cursor_expired(&body);
+        warn_if_cursor_expired(&body, save_output_hint.as_deref());
         if !args.json {
             dump_process_chunks(&body)?;
         }
@@ -455,7 +461,7 @@ async fn process_read_loop(
             return print_error_response(response).await;
         }
         let body: ProcessReadResponse = response.json().await?;
-        warn_if_cursor_expired(&body);
+        warn_if_cursor_expired(&body, None);
         if text {
             dump_process_chunks(&body)?;
         } else {
@@ -502,7 +508,7 @@ async fn print_process_tail_on_error(
     let mut retained = Vec::new();
     for _ in 0..10_000 {
         let body = read_process_once(auth, process_id, after_seq, max_bytes, None).await?;
-        warn_if_cursor_expired(&body);
+        warn_if_cursor_expired(&body, None);
         append_process_chunk_bytes(&body, &mut retained)?;
         if retained.len() > tail_bytes {
             let remove = retained.len() - tail_bytes;
@@ -561,12 +567,19 @@ fn dump_process_chunks(body: &ProcessReadResponse) -> Result<()> {
     Ok(())
 }
 
-fn warn_if_cursor_expired(body: &ProcessReadResponse) {
+fn warn_if_cursor_expired(body: &ProcessReadResponse, save_output_path: Option<&str>) {
     if body.cursor_expired {
-        eprintln!(
-            "[agentplane] process output cursor expired for {}; resumed at seq {}. Increase --output-bytes-limit or the server process output retention limits to avoid losing earlier logs.",
-            body.process_id, body.available_from_seq
-        );
+        if let Some(save_output_path) = save_output_path {
+            eprintln!(
+                "[agentplane] process output cursor expired for {}; resumed at seq {}. Full output was saved to remote path {}.",
+                body.process_id, body.available_from_seq, save_output_path
+            );
+        } else {
+            eprintln!(
+                "[agentplane] process output cursor expired for {}; resumed at seq {}. Increase --output-bytes-limit or the server process output retention limits to avoid losing earlier logs.",
+                body.process_id, body.available_from_seq
+            );
+        }
     }
 }
 

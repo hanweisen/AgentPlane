@@ -42,6 +42,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
             claims: Vec::new(),
             timeout_seconds: Some(5),
             output_bytes_limit: None,
+            save_output_path: None,
             pipe_stdin: true,
             kill_tree_on_terminate: false,
         },
@@ -96,6 +97,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
             claims: Vec::new(),
             timeout_seconds: Some(1),
             output_bytes_limit: None,
+            save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
         },
@@ -134,6 +136,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
             claims: Vec::new(),
             timeout_seconds: None,
             output_bytes_limit: None,
+            save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
         },
@@ -186,6 +189,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
             claims: Vec::new(),
             timeout_seconds: Some(5),
             output_bytes_limit: None,
+            save_output_path: None,
             pipe_stdin: true,
             kill_tree_on_terminate: false,
         },
@@ -240,6 +244,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
                 claims: Vec::new(),
                 timeout_seconds: None,
                 output_bytes_limit: None,
+                save_output_path: None,
                 pipe_stdin: false,
                 kill_tree_on_terminate: false,
             },
@@ -488,6 +493,7 @@ async fn process_read_supports_sequence_cursor_wait_and_binary_output() -> Resul
             claims: Vec::new(),
             timeout_seconds: Some(5),
             output_bytes_limit: None,
+            save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
         },
@@ -546,6 +552,7 @@ async fn process_read_supports_sequence_cursor_wait_and_binary_output() -> Resul
             claims: Vec::new(),
             timeout_seconds: Some(5),
             output_bytes_limit: None,
+            save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
         },
@@ -595,6 +602,7 @@ async fn process_output_limit_truncates_old_chunks_and_reports_cursor_expiry() -
             claims: Vec::new(),
             timeout_seconds: Some(5),
             output_bytes_limit: Some(8),
+            save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
         },
@@ -625,6 +633,142 @@ async fn process_output_limit_truncates_old_chunks_and_reports_cursor_expiry() -
     assert!(response.available_from_seq > 0);
     let stdout = decode_process_chunks(&response.chunks, ProcessOutputStream::Stdout)?;
     assert!(!stdout.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_save_output_path_preserves_full_output_and_validates_config() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+    let command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "printf 'stdout-full-line-0001\\n'; printf 'stderr-full-line-0002\\n' >&2; \
+         for i in $(seq 1 20); do printf 'payload-%04d-xxxxxxxxxxxxxxxx\\n' \"$i\"; done"
+            .to_string(),
+    ];
+
+    let first = handle_process_start(
+        &state,
+        ProcessStartRequest {
+            remote_root: remote_root.path().display().to_string(),
+            process_id: "saved-output".to_string(),
+            command: command.clone(),
+            cwd: None,
+            env: Some(Default::default()),
+            claims: Vec::new(),
+            timeout_seconds: Some(5),
+            output_bytes_limit: Some(32),
+            save_output_path: Some("logs/full.log".to_string()),
+            pipe_stdin: false,
+            kill_tree_on_terminate: false,
+        },
+    )
+    .await?;
+    assert!(first.created);
+
+    let mut exited = false;
+    let mut saw_truncation = false;
+    for _ in 0..40 {
+        let read = handle_process_read(
+            &state,
+            ProcessReadRequest {
+                process_id: "saved-output".to_string(),
+                after_seq: Some(0),
+                max_bytes: Some(4096),
+                wait_ms: Some(100),
+            },
+        )
+        .await?;
+        saw_truncation |= read.truncated;
+        exited = read.exited;
+        if exited {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(exited);
+    assert!(saw_truncation);
+
+    let saved = tokio::fs::read_to_string(remote_root.path().join("logs/full.log")).await?;
+    assert!(saved.contains("stdout-full-line-0001"));
+    assert!(saved.contains("stderr-full-line-0002"));
+    assert!(saved.contains("payload-0020-xxxxxxxxxxxxxxxx"));
+
+    let info = handle_process_get(
+        &state,
+        ProcessGetRequest {
+            process_id: "saved-output".to_string(),
+        },
+    )
+    .await?;
+    assert_eq!(
+        info.process.save_output_path.as_deref(),
+        Some("logs/full.log")
+    );
+
+    let second = handle_process_start(
+        &state,
+        ProcessStartRequest {
+            remote_root: remote_root.path().display().to_string(),
+            process_id: "saved-output".to_string(),
+            command: command.clone(),
+            cwd: None,
+            env: Some(Default::default()),
+            claims: Vec::new(),
+            timeout_seconds: Some(5),
+            output_bytes_limit: Some(32),
+            save_output_path: Some("logs/full.log".to_string()),
+            pipe_stdin: false,
+            kill_tree_on_terminate: false,
+        },
+    )
+    .await?;
+    assert!(second.already_exists);
+    let still_saved = tokio::fs::read_to_string(remote_root.path().join("logs/full.log")).await?;
+    assert_eq!(saved, still_saved);
+
+    let changed_save_path = handle_process_start(
+        &state,
+        ProcessStartRequest {
+            remote_root: remote_root.path().display().to_string(),
+            process_id: "saved-output".to_string(),
+            command,
+            cwd: None,
+            env: Some(Default::default()),
+            claims: Vec::new(),
+            timeout_seconds: Some(5),
+            output_bytes_limit: Some(32),
+            save_output_path: Some("logs/other.log".to_string()),
+            pipe_stdin: false,
+            kill_tree_on_terminate: false,
+        },
+    )
+    .await;
+    assert!(changed_save_path.is_err());
+
+    let escaped = handle_process_start(
+        &state,
+        ProcessStartRequest {
+            remote_root: remote_root.path().display().to_string(),
+            process_id: "escaped-output".to_string(),
+            command: vec!["bash".to_string(), "-lc".to_string(), "true".to_string()],
+            cwd: None,
+            env: Some(Default::default()),
+            claims: Vec::new(),
+            timeout_seconds: Some(5),
+            output_bytes_limit: Some(32),
+            save_output_path: Some("../escape.log".to_string()),
+            pipe_stdin: false,
+            kill_tree_on_terminate: false,
+        },
+    )
+    .await;
+    assert!(escaped.is_err());
+    assert!(!remote_root.path().join("../escape.log").exists());
     Ok(())
 }
 
@@ -660,6 +804,7 @@ async fn process_resource_limits_reject_excessive_usage_and_prune_finished_entri
             claims: Vec::new(),
             timeout_seconds: Some(1),
             output_bytes_limit: Some(128),
+            save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
         },
@@ -678,6 +823,7 @@ async fn process_resource_limits_reject_excessive_usage_and_prune_finished_entri
                 claims: Vec::new(),
                 timeout_seconds: Some(1),
                 output_bytes_limit: Some(128),
+                save_output_path: None,
                 pipe_stdin: false,
                 kill_tree_on_terminate: false,
             },
@@ -709,6 +855,7 @@ async fn process_resource_limits_reject_excessive_usage_and_prune_finished_entri
             claims: Vec::new(),
             timeout_seconds: Some(1),
             output_bytes_limit: Some(128),
+            save_output_path: None,
             pipe_stdin: true,
             kill_tree_on_terminate: false,
         },
@@ -740,6 +887,7 @@ async fn process_resource_limits_reject_excessive_usage_and_prune_finished_entri
                 claims: Vec::new(),
                 timeout_seconds: Some(10),
                 output_bytes_limit: Some(128),
+                save_output_path: None,
                 pipe_stdin: false,
                 kill_tree_on_terminate: false,
             },
@@ -774,6 +922,7 @@ async fn process_start_is_idempotent_and_supports_recovery_listing() -> Result<(
             claims: Vec::new(),
             timeout_seconds: Some(5),
             output_bytes_limit: Some(1024),
+            save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
         },
@@ -797,6 +946,7 @@ async fn process_start_is_idempotent_and_supports_recovery_listing() -> Result<(
             claims: Vec::new(),
             timeout_seconds: Some(5),
             output_bytes_limit: Some(1024),
+            save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
         },
@@ -821,6 +971,7 @@ async fn process_start_is_idempotent_and_supports_recovery_listing() -> Result<(
                 claims: Vec::new(),
                 timeout_seconds: Some(5),
                 output_bytes_limit: Some(1024),
+                save_output_path: None,
                 pipe_stdin: false,
                 kill_tree_on_terminate: false,
             },
@@ -924,6 +1075,41 @@ AP_REMOTE_ROOT={}
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(String::from_utf8(output.stdout)?, "run-ok\n");
     assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cli_process_run_save_output_path_writes_full_output() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let harness = CliServerHarness::start(remote_root.path(), token)?;
+
+    let output = run_cli(&[
+        "process-run",
+        "--server",
+        &harness.base_url,
+        "--token",
+        token,
+        "--remote-root",
+        &remote_root.path().display().to_string(),
+        "--process-id",
+        "cli-process-run-save-output",
+        "--wait-ms",
+        "100",
+        "--save-output-path",
+        "logs/run.log",
+        "--",
+        "bash",
+        "-lc",
+        "printf 'cli-stdout\\n'; printf 'cli-stderr\\n' >&2; exit 7",
+    ])?;
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(String::from_utf8(output.stdout)?, "cli-stdout\n");
+    assert_eq!(String::from_utf8(output.stderr)?, "cli-stderr\n");
+
+    let saved = std::fs::read_to_string(remote_root.path().join("logs/run.log"))?;
+    assert!(saved.contains("cli-stdout"));
+    assert!(saved.contains("cli-stderr"));
     Ok(())
 }
 

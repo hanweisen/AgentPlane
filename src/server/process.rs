@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
-use super::file::{resolve_cwd, resolve_remote_root};
+use super::file::{resolve_cwd, resolve_remote_root, safe_join};
 use super::util::{parse_i32_field, unix_now_ms};
 use super::{ServerLimits, ServerState};
 use crate::protocol::{
@@ -73,6 +74,7 @@ pub(super) struct ManagedProcess {
     started_at_unix_ms: u128,
     timeout_seconds: Option<u64>,
     output_bytes_limit: usize,
+    save_output_path: Option<String>,
     claimed_resources: Vec<ResourceClaim>,
     exit_code: Option<i32>,
     failure: Option<String>,
@@ -90,6 +92,7 @@ impl ManagedProcess {
             &self.claimed_resources,
             self.pipe_stdin,
             self.kill_tree_on_terminate,
+            self.save_output_path.as_deref(),
             self.timeout_seconds,
             self.output_bytes_limit,
         )
@@ -271,6 +274,7 @@ pub(super) async fn handle_process_start_with_lease(
         .min(state.limits.max_process_output_limit_bytes);
     let requested_kill_tree_on_terminate =
         payload.kill_tree_on_terminate || state.limits.default_kill_tree_on_terminate;
+    let requested_save_output_path = payload.save_output_path.clone();
     let requested_claims = if execution_lease.is_some() {
         merge_resource_claims(
             &payload.claims,
@@ -288,6 +292,7 @@ pub(super) async fn handle_process_start_with_lease(
             &requested_claims,
             requested_output_limit,
             requested_kill_tree_on_terminate,
+            requested_save_output_path.as_deref(),
         ) {
             if let Some(execution_lease) = execution_lease
                 && !requested_claims.is_empty()
@@ -314,6 +319,8 @@ pub(super) async fn handle_process_start_with_lease(
         );
     }
     enforce_process_capacity(&processes, &state.limits)?;
+    let save_output_file =
+        prepare_save_output_file(&remote_root, requested_save_output_path.as_deref()).await?;
     let reserved_resource_claims = if let Some(execution_lease) = execution_lease {
         let mut modes = state.modes.lock().await;
         modes.claim_resources(
@@ -379,6 +386,7 @@ pub(super) async fn handle_process_start_with_lease(
             Arc::clone(&output),
             ProcessOutputStream::Stdout,
             output_limit,
+            save_output_file.clone(),
         );
     }
     if let Some(stderr) = stderr {
@@ -391,6 +399,7 @@ pub(super) async fn handle_process_start_with_lease(
             Arc::clone(&output),
             ProcessOutputStream::Stderr,
             output_limit,
+            save_output_file.clone(),
         );
     }
     processes.insert(
@@ -410,6 +419,7 @@ pub(super) async fn handle_process_start_with_lease(
             started_at_unix_ms: unix_now_ms(),
             timeout_seconds: payload.timeout_seconds,
             output_bytes_limit: output_limit,
+            save_output_path: requested_save_output_path,
             claimed_resources: requested_claims,
             exit_code: None,
             failure: None,
@@ -714,6 +724,7 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
         failure,
         children_running,
         pid,
+        save_output_path,
         output,
     ) = {
         let mut processes = state.processes.lock().await;
@@ -737,6 +748,7 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
             process.failure.clone(),
             process_children_running(process),
             process.pid,
+            process.save_output_path.clone(),
             Arc::clone(&process.output),
         )
     };
@@ -776,6 +788,7 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
         pid,
         elapsed_ms,
         last_output_at_unix_ms,
+        save_output_path,
     })
 }
 
@@ -1042,11 +1055,44 @@ fn enforce_process_capacity(
     Ok(())
 }
 
+async fn prepare_save_output_file(
+    remote_root: &Path,
+    save_output_path: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let Some(save_output_path) = save_output_path else {
+        return Ok(None);
+    };
+    let path = safe_join(remote_root, save_output_path)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("failed to create save output file: {}", path.display()))?;
+    Ok(Some(path))
+}
+
+async fn append_saved_output(path: &Path, data: &[u8]) -> Result<()> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(data).await?;
+    file.flush().await?;
+    Ok(())
+}
+
 fn spawn_reader<R>(
     mut reader: R,
     output: Arc<Mutex<ProcessOutputState>>,
     stream: ProcessOutputStream,
     output_limit: usize,
+    save_output_path: Option<PathBuf>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -1057,8 +1103,16 @@ fn spawn_reader<R>(
             match reader.read(&mut local).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut target = output.lock().await;
                     let data = local[..n].to_vec();
+                    if let Some(path) = save_output_path.as_deref()
+                        && let Err(error) = append_saved_output(path, &data).await
+                    {
+                        eprintln!(
+                            "[agentplane] failed to append process output to {}: {error:#}",
+                            path.display()
+                        );
+                    }
+                    let mut target = output.lock().await;
                     target.total_bytes += data.len();
                     target.last_output_at_unix_ms = Some(unix_now_ms());
                     let seq = target.next_seq;

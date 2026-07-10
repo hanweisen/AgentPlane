@@ -16,6 +16,8 @@ pub struct ProcessStartRequest {
     pub pipe_stdin: bool,
     #[serde(default)]
     pub kill_tree_on_terminate: bool,
+    #[serde(default)]
+    pub save_output_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +28,7 @@ pub(crate) struct ProcessStartConfig<'a> {
     claims: &'a [ResourceClaim],
     pipe_stdin: bool,
     kill_tree_on_terminate: bool,
+    save_output_path: Option<&'a str>,
     timeout_seconds: Option<u64>,
     output_bytes_limit: usize,
 }
@@ -38,6 +41,7 @@ impl<'a> ProcessStartConfig<'a> {
         claims: &'a [ResourceClaim],
         pipe_stdin: bool,
         kill_tree_on_terminate: bool,
+        save_output_path: Option<&'a str>,
         timeout_seconds: Option<u64>,
         output_bytes_limit: usize,
     ) -> Self {
@@ -48,6 +52,7 @@ impl<'a> ProcessStartConfig<'a> {
             claims,
             pipe_stdin,
             kill_tree_on_terminate,
+            save_output_path,
             timeout_seconds,
             output_bytes_limit,
         }
@@ -63,6 +68,7 @@ impl ProcessStartRequest {
         claims: &[ResourceClaim],
         output_bytes_limit: usize,
         kill_tree_on_terminate: bool,
+        save_output_path: Option<&str>,
     ) -> bool {
         existing.remote_root == remote_root
             && existing.cwd == cwd
@@ -70,6 +76,7 @@ impl ProcessStartRequest {
             && existing.claims == claims
             && existing.pipe_stdin == self.pipe_stdin
             && existing.kill_tree_on_terminate == kill_tree_on_terminate
+            && existing.save_output_path == save_output_path
             && existing.timeout_seconds == self.timeout_seconds
             && existing.output_bytes_limit == output_bytes_limit
     }
@@ -130,6 +137,8 @@ pub struct ProcessInfo {
     pub elapsed_ms: u128,
     #[serde(default)]
     pub last_output_at_unix_ms: Option<u128>,
+    #[serde(default)]
+    pub save_output_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

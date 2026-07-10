@@ -1198,7 +1198,7 @@ fn directory_contains_preserved_entries(
     }))
 }
 
-fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+pub(super) fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
     let relative_path = Path::new(relative);
     if relative_path.is_absolute() {
         bail!("path escapes remote root: {relative}");
