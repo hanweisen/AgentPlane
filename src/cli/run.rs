@@ -163,8 +163,12 @@ fn run_dir() -> PathBuf {
 
 fn manifest_cache_path(run_id: &str) -> Result<PathBuf> {
     let mut path = run_dir();
-    path.push(sanitize_run_id(run_id)?);
-    path.set_extension("json");
+    // Append ".json" directly instead of `set_extension`: a run_id like
+    // "run.42" would otherwise have its ".42" treated as the extension and
+    // replaced, colliding with "run.json" (both → "run.json"). Direct append
+    // keeps the run_id intact in the filename and avoids the collision.
+    // sanitize_run_id already rejects `/`, `\`, and `..`, so this is path-safe.
+    path.push(format!("{}.json", sanitize_run_id(run_id)?));
     Ok(path)
 }
 
@@ -230,4 +234,62 @@ fn unix_now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_path(run_id: &str) -> String {
+        // Run under a tmp AP_RUN_DIR so it does not touch the user's home.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: tests within this binary run serially on a single thread, so
+        // mutating the process environment here cannot race with another test.
+        unsafe {
+            std::env::set_var("AP_RUN_DIR", dir.path());
+        }
+        let path = manifest_cache_path(run_id).expect("cache path");
+        // SAFETY: same single-threaded test serialization as above.
+        unsafe {
+            std::env::remove_var("AP_RUN_DIR");
+        }
+        path.file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn dotted_run_id_does_not_collide_with_plain_name() {
+        // Regression: "run.42" used to map to "run.json" via set_extension,
+        // colliding with "run.json". They must now be distinct files.
+        assert_eq!(cache_path("run.42"), "run.42.json");
+        assert_eq!(cache_path("run.json"), "run.json.json");
+        assert_ne!(cache_path("run.42"), cache_path("run.json"));
+    }
+
+    #[test]
+    fn plain_run_id_keeps_json_suffix() {
+        assert_eq!(cache_path("run42"), "run42.json");
+        assert_eq!(cache_path("run_42-a.b"), "run_42-a.b.json");
+    }
+
+    #[test]
+    fn rejects_path_traversal_run_ids() {
+        assert!(sanitize_run_id("").is_err());
+        assert!(sanitize_run_id("..").is_err());
+        assert!(sanitize_run_id("evil/../escape").is_err());
+        assert!(sanitize_run_id("back\\slash").is_err());
+        assert!(sanitize_run_id("a/b").is_err());
+    }
+
+    #[test]
+    fn accepts_normal_run_ids() {
+        assert_eq!(sanitize_run_id("run42").unwrap(), "run42");
+        assert_eq!(sanitize_run_id("run_42-a.b").unwrap(), "run_42-a.b");
+        assert_eq!(
+            sanitize_run_id("2026-07-11-pretrain").unwrap(),
+            "2026-07-11-pretrain"
+        );
+    }
 }
