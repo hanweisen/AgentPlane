@@ -15,9 +15,10 @@ use crate::cli_client::{
 use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
 use crate::protocol::{
     CleanupProcess, ProcessCleanupAcceleratorSummary, ProcessCleanupRequest,
-    ProcessCleanupResponse, ProcessGetRequest, ProcessGetResponse, ProcessListResponse,
-    ProcessReadRequest, ProcessReadResponse, ProcessStartRequest, ProcessStartResponse,
-    ProcessTerminateRequest, ProcessWriteRequest, SimpleResponse, parse_resource_claim_specs,
+    ProcessCleanupResponse, ProcessGetRequest, ProcessGetResponse, ProcessListRequest,
+    ProcessListResponse, ProcessReadRequest, ProcessReadResponse, ProcessStartRequest,
+    ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest, SimpleResponse,
+    parse_resource_claim_specs,
 };
 
 use super::{
@@ -45,6 +46,7 @@ pub(super) async fn process_start(
         save_output_path: args.save_output_path,
         pipe_stdin: args.pipe_stdin,
         kill_tree_on_terminate: args.kill_tree_on_terminate,
+        run_id: args.run_id.or_else(|| profile.run_id.clone()),
     };
     let body = post_process_start_with_recovery(&auth, &payload).await?;
     let body = enrich_start_response(body, &auth);
@@ -133,8 +135,10 @@ pub(super) async fn process_status(
             print_error_response(response).await
         }
         None => {
-            let response =
-                post_json(&auth, "/v1/process/list", &serde_json::json!({}), true).await?;
+            let list_payload = ProcessListRequest {
+                run_id: args.run_id.clone(),
+            };
+            let response = post_json(&auth, "/v1/process/list", &list_payload, true).await?;
             if response.status() == StatusCode::OK {
                 let body: ProcessListResponse = response.json().await?;
                 let mut processes = body.processes;
@@ -232,6 +236,7 @@ pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -
         save_output_path: save_output_path.clone(),
         pipe_stdin: false,
         kill_tree_on_terminate: false,
+        run_id: args.run_id.or_else(|| profile.run_id.clone()),
     };
     let start = post_process_start_with_recovery(&auth, &start_payload).await?;
     if !start.ok {

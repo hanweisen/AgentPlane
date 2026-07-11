@@ -27,9 +27,9 @@ pub(crate) use process::ProcessStartConfig;
 pub use process::{
     CleanupProcess, ProcessCleanupAcceleratorProcess, ProcessCleanupAcceleratorSummary,
     ProcessCleanupRequest, ProcessCleanupResponse, ProcessGetRequest, ProcessGetResponse,
-    ProcessInfo, ProcessListResponse, ProcessOutputChunk, ProcessOutputStream, ProcessReadRequest,
-    ProcessReadResponse, ProcessStartRequest, ProcessStartResponse, ProcessTerminateRequest,
-    ProcessWriteRequest,
+    ProcessInfo, ProcessListRequest, ProcessListResponse, ProcessOutputChunk, ProcessOutputStream,
+    ProcessReadRequest, ProcessReadResponse, ProcessStartRequest, ProcessStartResponse,
+    ProcessTerminateRequest, ProcessWriteRequest,
 };
 pub use resource::{
     ResourceClaim, format_resource_claim, infer_gpu_resource_claims_from_process_env,

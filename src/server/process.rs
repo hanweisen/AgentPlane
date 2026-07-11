@@ -17,10 +17,11 @@ use super::util::{parse_i32_field, unix_now_ms};
 use super::{ServerLimits, ServerState};
 use crate::protocol::{
     CleanupProcess, ProcessCleanupRequest, ProcessCleanupResponse, ProcessGetRequest,
-    ProcessGetResponse, ProcessInfo, ProcessListResponse, ProcessOutputChunk, ProcessOutputStream,
-    ProcessReadRequest, ProcessReadResponse, ProcessStartConfig, ProcessStartRequest,
-    ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest, ResourceClaim,
-    SimpleResponse, infer_gpu_resource_claims_from_process_env, merge_resource_claims,
+    ProcessGetResponse, ProcessInfo, ProcessListRequest, ProcessListResponse, ProcessOutputChunk,
+    ProcessOutputStream, ProcessReadRequest, ProcessReadResponse, ProcessStartConfig,
+    ProcessStartRequest, ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest,
+    ResourceClaim, SimpleResponse, infer_gpu_resource_claims_from_process_env,
+    merge_resource_claims,
 };
 use crate::server::auth::ExecutionLease;
 
@@ -75,6 +76,7 @@ pub(super) struct ManagedProcess {
     timeout_seconds: Option<u64>,
     output_bytes_limit: usize,
     save_output_path: Option<String>,
+    run_id: Option<String>,
     claimed_resources: Vec<ResourceClaim>,
     exit_code: Option<i32>,
     failure: Option<String>,
@@ -93,6 +95,7 @@ impl ManagedProcess {
             self.pipe_stdin,
             self.kill_tree_on_terminate,
             self.save_output_path.as_deref(),
+            self.run_id.as_deref(),
             self.timeout_seconds,
             self.output_bytes_limit,
         )
@@ -275,6 +278,7 @@ pub(super) async fn handle_process_start_with_lease(
     let requested_kill_tree_on_terminate =
         payload.kill_tree_on_terminate || state.limits.default_kill_tree_on_terminate;
     let requested_save_output_path = payload.save_output_path.clone();
+    let requested_run_id = payload.run_id.clone();
     let requested_claims = if execution_lease.is_some() {
         merge_resource_claims(
             &payload.claims,
@@ -293,6 +297,7 @@ pub(super) async fn handle_process_start_with_lease(
             requested_output_limit,
             requested_kill_tree_on_terminate,
             requested_save_output_path.as_deref(),
+            requested_run_id.as_deref(),
         ) {
             if let Some(execution_lease) = execution_lease
                 && !requested_claims.is_empty()
@@ -420,6 +425,7 @@ pub(super) async fn handle_process_start_with_lease(
             timeout_seconds: payload.timeout_seconds,
             output_bytes_limit: output_limit,
             save_output_path: requested_save_output_path,
+            run_id: requested_run_id,
             claimed_resources: requested_claims,
             exit_code: None,
             failure: None,
@@ -470,7 +476,10 @@ pub async fn handle_process_get(
     Ok(ProcessGetResponse { ok: true, process })
 }
 
-pub async fn handle_process_list(state: &ServerState) -> Result<ProcessListResponse> {
+pub async fn handle_process_list(
+    state: &ServerState,
+    payload: ProcessListRequest,
+) -> Result<ProcessListResponse> {
     let process_ids = {
         let mut processes = state.processes.lock().await;
         prune_finished_processes(&mut processes, &state.limits);
@@ -478,7 +487,16 @@ pub async fn handle_process_list(state: &ServerState) -> Result<ProcessListRespo
     };
     let mut processes = Vec::with_capacity(process_ids.len());
     for process_id in process_ids {
-        processes.push(snapshot_process_info(state, &process_id).await?);
+        let info = snapshot_process_info(state, &process_id).await?;
+        // Server-side run_id filter (feedback §7 Phase 1). None/empty filter
+        // returns everything (backward compatible with the old `{}` payload).
+        if let Some(run_id) = payload.run_id.as_deref()
+            && !run_id.is_empty()
+            && info.run_id.as_deref() != Some(run_id)
+        {
+            continue;
+        }
+        processes.push(info);
     }
     processes.sort_by(|a, b| a.process_id.cmp(&b.process_id));
     Ok(ProcessListResponse {
@@ -740,6 +758,7 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
         children_running,
         pid,
         save_output_path,
+        run_id,
         output,
     ) = {
         let mut processes = state.processes.lock().await;
@@ -764,6 +783,7 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
             process_children_running(process),
             process.pid,
             process.save_output_path.clone(),
+            process.run_id.clone(),
             Arc::clone(&process.output),
         )
     };
@@ -804,6 +824,7 @@ async fn snapshot_process_info(state: &ServerState, process_id: &str) -> Result<
         elapsed_ms,
         last_output_at_unix_ms,
         save_output_path,
+        run_id,
     })
 }
 

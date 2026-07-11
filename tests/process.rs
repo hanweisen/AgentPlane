@@ -4,8 +4,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use agentplane::protocol::{
-    ProcessCleanupRequest, ProcessGetRequest, ProcessOutputStream, ProcessReadRequest,
-    ProcessStartRequest, ProcessTerminateRequest, ProcessWriteRequest,
+    ProcessCleanupRequest, ProcessGetRequest, ProcessListRequest, ProcessOutputStream,
+    ProcessReadRequest, ProcessStartRequest, ProcessTerminateRequest, ProcessWriteRequest,
 };
 use agentplane::server::{
     ServerLimits, ServerState, handle_process_cleanup, handle_process_get, handle_process_list,
@@ -45,6 +45,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
             save_output_path: None,
             pipe_stdin: true,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -100,6 +101,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
             save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -139,6 +141,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
             save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -192,6 +195,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
             save_output_path: None,
             pipe_stdin: true,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -247,6 +251,7 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
                 save_output_path: None,
                 pipe_stdin: false,
                 kill_tree_on_terminate: false,
+                run_id: None,
             },
         )
         .await
@@ -636,6 +641,7 @@ async fn process_read_supports_sequence_cursor_wait_and_binary_output() -> Resul
             save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -695,6 +701,7 @@ async fn process_read_supports_sequence_cursor_wait_and_binary_output() -> Resul
             save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -745,6 +752,7 @@ async fn process_output_limit_truncates_old_chunks_and_reports_cursor_expiry() -
             save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -805,6 +813,7 @@ async fn process_save_output_path_preserves_full_output_and_validates_config() -
             save_output_path: Some("logs/full.log".to_string()),
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -864,6 +873,7 @@ async fn process_save_output_path_preserves_full_output_and_validates_config() -
             save_output_path: Some("logs/full.log".to_string()),
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -885,6 +895,7 @@ async fn process_save_output_path_preserves_full_output_and_validates_config() -
             save_output_path: Some("logs/other.log".to_string()),
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await;
@@ -904,6 +915,7 @@ async fn process_save_output_path_preserves_full_output_and_validates_config() -
             save_output_path: Some("../escape.log".to_string()),
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await;
@@ -947,6 +959,7 @@ async fn process_resource_limits_reject_excessive_usage_and_prune_finished_entri
             save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -966,6 +979,7 @@ async fn process_resource_limits_reject_excessive_usage_and_prune_finished_entri
                 save_output_path: None,
                 pipe_stdin: false,
                 kill_tree_on_terminate: false,
+                run_id: None,
             },
         )
         .await
@@ -998,6 +1012,7 @@ async fn process_resource_limits_reject_excessive_usage_and_prune_finished_entri
             save_output_path: None,
             pipe_stdin: true,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -1030,6 +1045,7 @@ async fn process_resource_limits_reject_excessive_usage_and_prune_finished_entri
                 save_output_path: None,
                 pipe_stdin: false,
                 kill_tree_on_terminate: false,
+                run_id: None,
             },
         )
         .await
@@ -1065,6 +1081,7 @@ async fn process_start_is_idempotent_and_supports_recovery_listing() -> Result<(
             save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -1089,6 +1106,7 @@ async fn process_start_is_idempotent_and_supports_recovery_listing() -> Result<(
             save_output_path: None,
             pipe_stdin: false,
             kill_tree_on_terminate: false,
+            run_id: None,
         },
     )
     .await?;
@@ -1114,13 +1132,14 @@ async fn process_start_is_idempotent_and_supports_recovery_listing() -> Result<(
                 save_output_path: None,
                 pipe_stdin: false,
                 kill_tree_on_terminate: false,
+                run_id: None,
             },
         )
         .await
         .is_err()
     );
 
-    let listed = handle_process_list(&state).await?;
+    let listed = handle_process_list(&state, ProcessListRequest { run_id: None }).await?;
     assert_eq!(listed.processes.len(), 1);
     assert_eq!(listed.processes[0].process_id, "recoverable");
 
@@ -2627,5 +2646,133 @@ fn cli_process_run_tail_on_error_includes_head_and_tail() -> Result<()> {
         head_idx < tail_idx,
         "head should print before tail: {stderr}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_start_echoes_run_id_and_status_lists_it() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+
+    handle_process_start(
+        &state,
+        ProcessStartRequest {
+            remote_root: remote_root.path().display().to_string(),
+            process_id: "run-echo".to_string(),
+            command: vec!["bash".to_string(), "-lc".to_string(), "echo hi".to_string()],
+            cwd: None,
+            env: Some(Default::default()),
+            claims: Vec::new(),
+            timeout_seconds: Some(5),
+            output_bytes_limit: None,
+            save_output_path: None,
+            pipe_stdin: false,
+            kill_tree_on_terminate: false,
+            run_id: Some("run42".to_string()),
+        },
+    )
+    .await?;
+
+    let info = handle_process_get(
+        &state,
+        ProcessGetRequest {
+            process_id: "run-echo".to_string(),
+        },
+    )
+    .await?;
+    assert_eq!(info.process.run_id.as_deref(), Some("run42"));
+
+    // An unfiltered list returns it; a run_id filter returns only matching ones.
+    let all = handle_process_list(&state, ProcessListRequest { run_id: None }).await?;
+    assert!(all.processes.iter().any(|p| p.process_id == "run-echo"));
+
+    let filtered = handle_process_list(
+        &state,
+        ProcessListRequest {
+            run_id: Some("run42".to_string()),
+        },
+    )
+    .await?;
+    assert_eq!(filtered.processes.len(), 1);
+    assert_eq!(filtered.processes[0].process_id, "run-echo");
+    assert_eq!(filtered.processes[0].run_id.as_deref(), Some("run42"));
+
+    let other = handle_process_list(
+        &state,
+        ProcessListRequest {
+            run_id: Some("nonexistent".to_string()),
+        },
+    )
+    .await?;
+    assert!(other.processes.is_empty());
+
+    let _ = run_cli(&[
+        "process-terminate",
+        "--server",
+        "127.0.0.1:0",
+        "--token",
+        "test-token",
+        "--process-id",
+        "run-echo",
+    ]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_start_rejects_mismatched_run_id_on_reconnect() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+
+    let base = ProcessStartRequest {
+        remote_root: remote_root.path().display().to_string(),
+        process_id: "reconnect-run".to_string(),
+        command: vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "sleep 30".to_string(),
+        ],
+        cwd: None,
+        env: Some(Default::default()),
+        claims: Vec::new(),
+        timeout_seconds: None,
+        output_bytes_limit: None,
+        save_output_path: None,
+        pipe_stdin: false,
+        kill_tree_on_terminate: false,
+        run_id: Some("runA".to_string()),
+    };
+    handle_process_start(&state, base.clone()).await?;
+
+    // Same process_id + same run_id -> reconnect-safe (created=false, already_exists=true).
+    let again = handle_process_start(&state, base.clone()).await?;
+    assert!(!again.created);
+    assert!(again.already_exists);
+
+    // Same process_id but DIFFERENT run_id -> must be rejected (config mismatch).
+    let mut mismatched = base.clone();
+    mismatched.run_id = Some("runB".to_string());
+    let result = handle_process_start(&state, mismatched).await;
+    assert!(result.is_err(), "mismatched run_id should be rejected");
+    let err = format!("{:#}", result.unwrap_err());
+    assert!(
+        err.contains("run_id") || err.contains("configuration") || err.contains("mismatch"),
+        "error should mention run_id/config mismatch: {err}"
+    );
+
+    let _ = run_cli(&[
+        "process-terminate",
+        "--server",
+        "127.0.0.1:0",
+        "--token",
+        "test-token",
+        "--process-id",
+        "reconnect-run",
+    ]);
     Ok(())
 }

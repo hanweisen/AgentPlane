@@ -354,6 +354,7 @@ fn process_matches_start_request(
             || (!payload.kill_tree_on_terminate && process.kill_tree_on_terminate))
         && process.timeout_seconds == payload.timeout_seconds
         && process.output_bytes_limit == requested_output_limit
+        && process.run_id == payload.run_id
 }
 
 pub(crate) async fn process_error_response(response: reqwest::Response) -> anyhow::Error {

@@ -18,6 +18,21 @@ pub struct ProcessStartRequest {
     pub kill_tree_on_terminate: bool,
     #[serde(default)]
     pub save_output_path: Option<String>,
+    /// Optional grouping label tying related processes together across one or
+    /// more nodes (feedback §7). Free-form client-chosen string; the server
+    /// stores and echoes it without validating its format. A retry with the
+    /// same `process_id` but a different `run_id` is rejected (reconnect-safe).
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+/// Filtering options for `process-list`. All fields optional and
+/// `#[serde(default)]` so an older client sending `{}` is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProcessListRequest {
+    /// When set, only return processes whose `run_id` equals this value.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +44,7 @@ pub(crate) struct ProcessStartConfig<'a> {
     pipe_stdin: bool,
     kill_tree_on_terminate: bool,
     save_output_path: Option<&'a str>,
+    run_id: Option<&'a str>,
     timeout_seconds: Option<u64>,
     output_bytes_limit: usize,
 }
@@ -42,6 +58,7 @@ impl<'a> ProcessStartConfig<'a> {
         pipe_stdin: bool,
         kill_tree_on_terminate: bool,
         save_output_path: Option<&'a str>,
+        run_id: Option<&'a str>,
         timeout_seconds: Option<u64>,
         output_bytes_limit: usize,
     ) -> Self {
@@ -53,6 +70,7 @@ impl<'a> ProcessStartConfig<'a> {
             pipe_stdin,
             kill_tree_on_terminate,
             save_output_path,
+            run_id,
             timeout_seconds,
             output_bytes_limit,
         }
@@ -69,6 +87,7 @@ impl ProcessStartRequest {
         output_bytes_limit: usize,
         kill_tree_on_terminate: bool,
         save_output_path: Option<&str>,
+        run_id: Option<&str>,
     ) -> bool {
         existing.remote_root == remote_root
             && existing.cwd == cwd
@@ -77,6 +96,7 @@ impl ProcessStartRequest {
             && existing.pipe_stdin == self.pipe_stdin
             && existing.kill_tree_on_terminate == kill_tree_on_terminate
             && existing.save_output_path == save_output_path
+            && existing.run_id == run_id
             && existing.timeout_seconds == self.timeout_seconds
             && existing.output_bytes_limit == output_bytes_limit
     }
@@ -139,6 +159,10 @@ pub struct ProcessInfo {
     pub last_output_at_unix_ms: Option<u128>,
     #[serde(default)]
     pub save_output_path: Option<String>,
+    /// Echoed run grouping label (feedback §7). Absent when no `--run-id` was
+    /// set, so old responses deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

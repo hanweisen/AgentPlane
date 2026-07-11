@@ -3,6 +3,7 @@ mod file;
 mod health;
 mod mode;
 mod process;
+mod run;
 mod server;
 mod sync;
 mod sync_session;
@@ -62,6 +63,8 @@ enum CommandKind {
     FileDelete(FileDeleteArgs),
     FileFind(FileFindArgs),
     FileList(FileListArgs),
+    RunShow(RunShowArgs),
+    RunManifest(RunManifestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -382,6 +385,11 @@ struct ProcessStartArgs {
     )]
     save_output_path: Option<String>,
     #[arg(
+        long = "run-id",
+        help = "Grouping label tying related processes together across one or more nodes. Overrides AP_RUN_ID."
+    )]
+    run_id: Option<String>,
+    #[arg(
         long = "env",
         help = "Repeatable KEY=VALUE or KEY= pairs for the remote environment."
     )]
@@ -425,6 +433,11 @@ struct ProcessRunArgs {
         help = "Remote-root-relative path that receives the full stdout/stderr stream."
     )]
     save_output_path: Option<String>,
+    #[arg(
+        long = "run-id",
+        help = "Grouping label tying related processes together across one or more nodes. Overrides AP_RUN_ID."
+    )]
+    run_id: Option<String>,
     #[arg(long = "max-bytes")]
     max_bytes: Option<usize>,
     #[arg(long = "wait-ms", default_value_t = 1000)]
@@ -588,6 +601,11 @@ struct ProcessStatusArgs {
         help = "Human-readable node label shown in process-status output. Overrides AP_LABEL."
     )]
     label: Option<String>,
+    #[arg(
+        long = "run-id",
+        help = "When listing (no --process-id), only return processes in this run."
+    )]
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -829,6 +847,52 @@ struct FileListArgs {
     path: Option<String>,
 }
 
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Agent usage:\n  run-show aggregates every process with --run-id <ID> across one or more --profile files, printing a per-node table and refreshing the local manifest cache. With --rebuild it reconstructs the manifest from server state alone."
+)]
+struct RunShowArgs {
+    run_id: String,
+    #[arg(
+        long = "profile",
+        value_name = "PATH",
+        help = "Profile file(s) to query. Repeatable. If omitted, the profiles recorded in the local manifest are used."
+    )]
+    profile: Vec<PathBuf>,
+    #[arg(
+        long = "text",
+        default_value_t = false,
+        help = "Print a per-node text table instead of JSON."
+    )]
+    text: bool,
+    #[arg(
+        long = "rebuild",
+        default_value_t = false,
+        help = "Reconstruct the manifest from server state (process-list on each profile) instead of reading the local cache."
+    )]
+    rebuild: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Agent usage:\n  run-manifest emits the JSON manifest for a run (aggregated from --profile files or the local cache). Use --out to write it next to the run logs."
+)]
+struct RunManifestArgs {
+    run_id: String,
+    #[arg(
+        long = "profile",
+        value_name = "PATH",
+        help = "Profile file(s) to query. Repeatable."
+    )]
+    profile: Vec<PathBuf>,
+    #[arg(
+        long = "out",
+        value_name = "PATH",
+        help = "Write the manifest to this path instead of stdout."
+    )]
+    out: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, clap::ValueEnum)]
 enum TlsModeArg {
     Off,
@@ -891,5 +955,7 @@ pub async fn run() -> Result<ExitCode> {
         CommandKind::FileDelete(args) => file::file_delete(args, &profile).await,
         CommandKind::FileFind(args) => file::file_find(args, &profile).await,
         CommandKind::FileList(args) => file::file_list(args, &profile).await,
+        CommandKind::RunShow(args) => run::run_show(args).await,
+        CommandKind::RunManifest(args) => run::run_manifest(args).await,
     }
 }

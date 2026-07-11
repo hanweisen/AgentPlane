@@ -227,6 +227,7 @@ AP_HEADER_1=X-Workspace-Context: example
 AP_CONNECT_RETRIES=5
 AP_CONNECT_RETRY_DELAY_MS=1000
 AP_LABEL=node13
+AP_RUN_ID=run42
 EOF
 
 ./agentplane --profile /tmp/agentplane.env process-list
@@ -398,6 +399,42 @@ When listing without `--process-id`, processes are sorted by most recent activit
 `process-start` responses include `next_commands` with ready-to-use `process-status`,
 `process-read`, and `process-terminate` command templates referencing the process id.
 The token is replaced with a `<token>` placeholder so the output is safe to log.
+
+### Group Processes Into A Run
+
+Multi-node experiments (a producer on node14, a consumer + sampler on node13) share a
+`run_id` so you can list and manifest them together. Set `--run-id` (or `AP_RUN_ID` in a
+profile) on `process-start` / `process-run`; the value is echoed by `process-status` /
+`process-get` / `process-list` and is the join key for `run-show` / `run-manifest`.
+
+```bash
+# One process per node, same run_id, full logs saved under runs/run42/
+./agentplane process-start --profile /tmp/node14.env \
+  --process-id run42-producer --run-id run42 \
+  --save-output-path runs/run42/producer.log -- python3 train.py
+./agentplane process-start --profile /tmp/node13.env \
+  --process-id run42-consumer --run-id run42 \
+  --save-output-path runs/run42/consumer.log -- python3 eval.py
+
+# List only processes in this run on one node
+./agentplane process-status --profile /tmp/node14.env --run-id run42
+
+# Aggregate across nodes and write a local manifest cache
+./agentplane run-show run42 \
+  --profile /tmp/node14.env --profile /tmp/node13.env
+
+# Export the manifest (reads the cache; no --profile needed once cached)
+./agentplane run-manifest run42 --out runs/run42/manifest.json
+```
+
+`run-show` queries each profile's `process-list` (filtered server-side by `run_id`), joins
+each process with its `save_output_path`, and prints a per-node view tagged with the
+`AP_LABEL`. With no `--profile`, it reuses the profiles recorded in the cached manifest;
+`--rebuild` reconstructs the manifest from server state alone. The manifest cache lives at
+`$AP_RUN_DIR/<run_id>.json` (default `~/.agentplane/runs/`); it is a cache, not the source
+of truth — the servers are. A retry of `process-start` with the same `--process-id` but a
+different `--run-id` is rejected (reconnect-safe), matching the existing `--save-output-path`
+rule.
 
 ### Manage Process Trees
 
@@ -662,6 +699,7 @@ Renew or release the lease at task boundaries:
 | Processes | `process-start`, `process-run`, `process-get`, `process-list`, `process-read`, `process-write`, `process-terminate`, `process-cleanup` |
 | Files | `file-read`, `file-stat`, `file-wait`, `file-write`, `file-upload`, `file-copy`, `file-delete`, `file-find`, `file-list` |
 | Accelerators | `accelerator-status`, `accelerator-preflight`, `accelerator-wait-idle`, `gpu-status`, `gpu-preflight`, `gpu-wait-idle` |
+| Runs | `run-show`, `run-manifest` |
 | Shared mode | `mode-get`, `mode-switch`, `lease-renew`, `lease-release` |
 | Server | `server` |
 

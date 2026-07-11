@@ -42,9 +42,9 @@ use crate::protocol::{
     FileUploadInitRequest, FileUploadStatusRequest, FileWriteRequest, LeaseReleaseRequest,
     LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, ModeGetRequest, ModeGetResponse,
     ModeSwitchRequest, ModeSwitchResponse, ProcessCleanupRequest, ProcessGetRequest,
-    ProcessReadRequest, ProcessStartRequest, ProcessTerminateRequest, ProcessWriteRequest,
-    SimpleResponse, SyncPayload, SyncSessionInitRequest, SyncSessionReleaseRequest,
-    SyncSessionStatusRequest,
+    ProcessListRequest, ProcessReadRequest, ProcessStartRequest, ProcessTerminateRequest,
+    ProcessWriteRequest, SimpleResponse, SyncPayload, SyncSessionInitRequest,
+    SyncSessionReleaseRequest, SyncSessionStatusRequest,
 };
 
 const DEFAULT_PROCESS_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
@@ -491,11 +491,12 @@ async fn process_get(
 async fn process_list(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
+    Json(payload): Json<ProcessListRequest>,
 ) -> impl IntoResponse {
     if !authorized(&headers, &state.token) {
         return unauthorized_response().into_response();
     }
-    match process::handle_process_list(&state).await {
+    match process::handle_process_list(&state, payload).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => bad_request_response(error).into_response(),
     }
