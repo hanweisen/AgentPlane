@@ -297,6 +297,8 @@ async fn process_cleanup_dry_run_reports_without_signaling_and_kill_requires_sig
                     dry_run: true,
                     kill: false,
                     signal: None,
+                    reconfirm: false,
+                    reconfirm_wait_ms: None,
                     accelerator_summary: None,
                 },
             )
@@ -327,6 +329,8 @@ async fn process_cleanup_dry_run_reports_without_signaling_and_kill_requires_sig
             dry_run: false,
             kill: true,
             signal: None,
+            reconfirm: false,
+            reconfirm_wait_ms: None,
             accelerator_summary: None,
         },
     )
@@ -341,6 +345,8 @@ async fn process_cleanup_dry_run_reports_without_signaling_and_kill_requires_sig
             dry_run: false,
             kill: true,
             signal: Some("TERM".to_string()),
+            reconfirm: true,
+            reconfirm_wait_ms: Some(2000),
             accelerator_summary: None,
         },
     )
@@ -352,6 +358,7 @@ async fn process_cleanup_dry_run_reports_without_signaling_and_kill_requires_sig
             .iter()
             .any(|process| process.pid == child.id() as i32)
     );
+    assert!(killed.verified);
     wait_for_child_exit(&mut child)?;
     Ok(())
 }
@@ -460,6 +467,7 @@ fn cli_process_cleanup_dry_run_and_explicit_term_signal() -> Result<()> {
         let killed_body: serde_json::Value = serde_json::from_slice(&killed.stdout)?;
         assert_eq!(killed_body["dry_run"], false);
         assert_eq!(killed_body["signal"], "TERM");
+        assert_eq!(killed_body["verified"], true);
         assert!(
             killed_body["signaled"]
                 .as_array()
@@ -468,6 +476,23 @@ fn cli_process_cleanup_dry_run_and_explicit_term_signal() -> Result<()> {
                 .any(|process| process["pid"].as_i64() == Some(child_pid))
         );
         wait_for_child_exit(&mut child)?;
+
+        let no_reconfirm = run_cli(&[
+            "process-cleanup",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--match",
+            &marker,
+            "--kill",
+            "--signal",
+            "TERM",
+            "--no-reconfirm",
+        ])?;
+        assert!(no_reconfirm.status.success());
+        let no_reconfirm_body: serde_json::Value = serde_json::from_slice(&no_reconfirm.stdout)?;
+        assert_eq!(no_reconfirm_body["verified"], false);
         Ok(())
     })();
 
@@ -544,13 +569,11 @@ fn cli_process_cleanup_reconfirm_reports_no_survivors_after_term() -> Result<()>
                 .any(|process| process["pid"].as_i64() == Some(child_pid)),
             "signaled list missing pid {child_pid}: {body}"
         );
-        // The closed loop should observe the signaled process exit within the
-        // settle window and report no survivors.
-        assert_eq!(body["reconfirm_ok"], true, "reconfirm_ok not true: {body}");
-        assert!(
-            body["remaining"].as_array().unwrap().is_empty(),
-            "remaining not empty: {body}"
-        );
+        // Server-side reconfirm should observe the signaled process exit within
+        // the settle window and report the protocol-level verdict.
+        assert_eq!(body["verified"], true, "verified not true: {body}");
+        assert!(body.get("remaining").is_none());
+        assert!(body.get("reconfirm_ok").is_none());
 
         // Text mode prints the closed-loop verdict.
         let mut text_child = Command::new("python3")

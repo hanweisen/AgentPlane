@@ -1,7 +1,5 @@
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -426,6 +424,8 @@ pub(super) async fn process_cleanup(
         dry_run: args.dry_run || !args.kill,
         kill: args.kill,
         signal: args.signal.clone(),
+        reconfirm: args.kill && args.reconfirm && !args.no_reconfirm,
+        reconfirm_wait_ms: Some(args.reconfirm_wait_ms),
         accelerator_summary,
     };
     let response = post_json(&auth, "/v1/process/cleanup", &payload, false).await?;
@@ -434,80 +434,17 @@ pub(super) async fn process_cleanup(
     }
     let body: ProcessCleanupResponse = response.json().await?;
 
-    // Optional closed loop: after a kill, poll the matcher again and report
-    // which signaled processes are still alive. Pure client-side follow-up; no
-    // protocol change. Bounded by --reconfirm-wait-ms so a slow exit does not
-    // hang the command.
-    let remaining = if args.kill && args.reconfirm {
-        Some(reconfirm_signaled(&auth, &args, &body).await?)
-    } else {
-        None
-    };
-
     if args.text && !args.json {
-        print_process_cleanup_text(&body, remaining.as_deref())?;
+        print_process_cleanup_text(&body, args.kill && args.reconfirm && !args.no_reconfirm)?;
     } else {
-        let mut value = serde_json::to_value(&body)?;
-        if let Some(remaining) = &remaining {
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("remaining".to_string(), serde_json::to_value(remaining)?);
-                obj.insert(
-                    "reconfirm_ok".to_string(),
-                    serde_json::json!(remaining.is_empty()),
-                );
-            }
-        }
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        println!("{}", serde_json::to_string_pretty(&body)?);
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// After a kill, poll `process-cleanup --dry-run` until none of the signaled
-/// PIDs remain matched, or until the settle window expires. Returns the subset
-/// of signaled processes that are still alive.
-async fn reconfirm_signaled(
-    auth: &ResolvedClientAuth,
-    args: &ProcessCleanupArgs,
-    body: &ProcessCleanupResponse,
-) -> Result<Vec<CleanupProcess>> {
-    let signaled_pids: HashSet<i32> = body.signaled.iter().map(|process| process.pid).collect();
-    if signaled_pids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let dry_run_payload = ProcessCleanupRequest {
-        process_match: args.process_match.clone(),
-        dry_run: true,
-        kill: false,
-        signal: None,
-        accelerator_summary: None,
-    };
-    let deadline = Instant::now() + Duration::from_millis(args.reconfirm_wait_ms.max(1));
-    let poll = Duration::from_millis(150);
-    let mut remaining = Vec::new();
-    loop {
-        let response = post_json(auth, "/v1/process/cleanup", &dry_run_payload, false).await?;
-        if response.status() == StatusCode::OK {
-            let reconfirm: ProcessCleanupResponse = response.json().await?;
-            remaining = reconfirm
-                .matched
-                .into_iter()
-                .filter(|process| signaled_pids.contains(&process.pid))
-                .collect();
-            if remaining.is_empty() {
-                break;
-            }
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(poll.min(deadline.saturating_duration_since(Instant::now()))).await;
-    }
-    Ok(remaining)
-}
-
 fn print_process_cleanup_text(
     body: &ProcessCleanupResponse,
-    remaining: Option<&[CleanupProcess]>,
+    reconfirm_requested: bool,
 ) -> Result<()> {
     if body.dry_run {
         println!("Dry run: no processes were signaled.");
@@ -539,17 +476,11 @@ fn print_process_cleanup_text(
             print_cleanup_process(process);
         }
     }
-    if let Some(remaining) = remaining {
-        if remaining.is_empty() {
+    if reconfirm_requested {
+        if body.verified {
             println!("Reconfirm: all signaled processes exited.");
         } else {
-            println!(
-                "Reconfirm: {} signaled process(es) still alive.",
-                remaining.len()
-            );
-            for process in remaining {
-                print_cleanup_process(process);
-            }
+            println!("Reconfirm: one or more signaled processes may still be alive.");
         }
     }
     println!("{}", body.agent_hint);
@@ -575,8 +506,8 @@ fn print_cleanup_process(process: &CleanupProcess) {
 }
 
 /// Render the optional accelerator occupancy summary in text mode. Each
-/// matched PID that holds device memory gets a `pid=… device=… mem=…MiB` row;
-/// PIDs with no occupancy are listed separately so it's clear the summary ran.
+/// matched PID that holds device memory gets a device and memory row;
+/// matched PIDs with no reported occupancy remain visible in the matched list.
 fn print_accelerator_summary_text(summary: Option<&ProcessCleanupAcceleratorSummary>) {
     let Some(summary) = summary else {
         return;
@@ -605,9 +536,14 @@ fn print_accelerator_summary_text(summary: Option<&ProcessCleanupAcceleratorSumm
             .used_memory_mib
             .map(|mem| format!("{mem} MiB"))
             .unwrap_or_else(|| "? MiB".to_string());
+        let total_mem = process
+            .memory_total_mib
+            .map(|mem| format!("{mem} MiB"))
+            .unwrap_or_else(|| "? MiB".to_string());
+        let device_name = process.device_name.as_deref().unwrap_or("?");
         println!(
-            "  pid={} device={} used_memory={}",
-            process.pid, device, mem
+            "  pid={} device={} device_name={} used_memory={} total_memory={}",
+            process.pid, device, device_name, mem, total_mem
         );
     }
 }

@@ -568,20 +568,27 @@ struct ProcessCleanupArgs {
     text: bool,
     #[arg(
         long = "reconfirm",
-        default_value_t = false,
-        help = "After --kill, poll the matching processes again and report which signaled processes are still alive."
+        default_value_t = true,
+        conflicts_with = "no_reconfirm",
+        help = "After --kill, ask the server to verify that all signaled processes exited (enabled by default)."
     )]
     reconfirm: bool,
     #[arg(
+        long = "no-reconfirm",
+        default_value_t = false,
+        help = "Do not wait for server-side exit verification after --kill."
+    )]
+    no_reconfirm: bool,
+    #[arg(
         long = "reconfirm-wait-ms",
         default_value_t = 2000,
-        help = "Upper bound for the --reconfirm settle window before reporting survivors."
+        help = "Upper bound for server-side exit verification after --kill."
     )]
     reconfirm_wait_ms: u64,
     #[arg(
         long = "accelerator-summary",
         value_name = "gpu|npu",
-        help = "With --dry-run, attach per-PID accelerator occupancy (device index + device memory) of the given kind. Ignored for --kill."
+        help = "With --dry-run, attach per-PID accelerator occupancy and device metadata of the given kind. Ignored for --kill."
     )]
     accelerator_summary: Option<AcceleratorKindArg>,
 }

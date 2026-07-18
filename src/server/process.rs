@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,6 +26,7 @@ use crate::protocol::{
 use crate::server::auth::ExecutionLease;
 
 const MAX_PROCESS_READ_WAIT_MS: u64 = 30_000;
+const MAX_PROCESS_CLEANUP_RECONFIRM_WAIT_MS: u64 = 30_000;
 const MAINTENANCE_INTERVAL_MS: u64 = 1000;
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
@@ -185,12 +186,14 @@ fn parse_cleanup_ps_row(row: &str) -> Option<CleanupProcess> {
     }
     let pid = parse_i32_field(fields[0])?;
     let command = row.split_whitespace().skip(7).collect::<Vec<_>>().join(" ");
+    let elapsed = fields[4].to_string();
     Some(CleanupProcess {
         pid,
         ppid: parse_i32_field(fields[1]),
         process_group_id: parse_i32_field(fields[2]),
         session_id: parse_i32_field(fields[3]),
-        elapsed: Some(fields[4].to_string()),
+        elapsed_seconds: parse_elapsed_seconds(&elapsed),
+        elapsed: Some(elapsed),
         stat: Some(fields[5].to_string()),
         user: Some(fields[6].to_string()),
         command: if command.is_empty() {
@@ -200,6 +203,25 @@ fn parse_cleanup_ps_row(row: &str) -> Option<CleanupProcess> {
         },
         skip_reason: None,
     })
+}
+
+fn parse_elapsed_seconds(elapsed: &str) -> Option<u64> {
+    let (days, time) = if let Some((days, time)) = elapsed.split_once('-') {
+        (days.parse::<u64>().ok()?, time)
+    } else {
+        (0, elapsed)
+    };
+    let parts = time.split(':').collect::<Vec<_>>();
+    let seconds = match parts.as_slice() {
+        [minutes, seconds] => minutes.parse::<u64>().ok()? * 60 + seconds.parse::<u64>().ok()?,
+        [hours, minutes, seconds] => {
+            hours.parse::<u64>().ok()? * 3600
+                + minutes.parse::<u64>().ok()? * 60
+                + seconds.parse::<u64>().ok()?
+        }
+        _ => return None,
+    };
+    Some(days * 86_400 + seconds)
 }
 
 fn parse_cleanup_signal(signal: &str) -> Result<i32> {
@@ -626,19 +648,52 @@ pub async fn handle_process_cleanup(
         }
     }
 
+    let verified = if payload.kill && payload.reconfirm {
+        let wait_ms = payload
+            .reconfirm_wait_ms
+            .unwrap_or(2000)
+            .min(MAX_PROCESS_CLEANUP_RECONFIRM_WAIT_MS);
+        reconfirm_signaled(process_match, &signaled, wait_ms).await?
+    } else {
+        false
+    };
+
     // Optional accelerator occupancy summary on dry-run (feedback §6). Built
     // only when requested and only for dry-run, so a --kill never pays the smi
     // cost and never blocks the signal path.
     let accelerator_summary = if dry_run {
         if let Some(kind) = payload.accelerator_summary {
-            let pids: Vec<i32> = matched.iter().map(|process| process.pid).collect();
-            Some(super::accelerator::accelerator_process_occupancy(state, kind, &pids).await)
+            if matched.is_empty() {
+                Some(crate::protocol::ProcessCleanupAcceleratorSummary {
+                    kind,
+                    available: true,
+                    reason: None,
+                    processes: Vec::new(),
+                })
+            } else {
+                let pids: Vec<i32> = matched.iter().map(|process| process.pid).collect();
+                Some(super::accelerator::accelerator_process_occupancy(state, kind, &pids).await)
+            }
         } else {
             None
         }
     } else {
         None
     };
+
+    let mut agent_hint = if dry_run {
+        "Dry run only. No process was signaled. To clean up, rerun with --kill --signal TERM after reviewing matched processes.".to_string()
+    } else {
+        "Cleanup signal was sent. To verify accelerator memory release, run process-cleanup --dry-run --accelerator-summary <gpu|npu> after a few seconds.".to_string()
+    };
+    if let Some(summary) = &accelerator_summary
+        && !summary.available
+    {
+        let reason = summary.reason.as_deref().unwrap_or("unknown reason");
+        agent_hint.push_str(&format!(
+            " WARNING: Accelerator status unavailable ({reason}). Cannot verify GPU/NPU occupancy for matched processes."
+        ));
+    }
 
     Ok(ProcessCleanupResponse {
         ok: true,
@@ -647,13 +702,40 @@ pub async fn handle_process_cleanup(
         matched,
         signaled,
         skipped,
-        agent_hint: if dry_run {
-            "Dry run only. No process was signaled. To clean up, rerun with --kill --signal TERM after reviewing matched processes.".to_string()
-        } else {
-            "Explicit cleanup signal was sent only to matched processes; review process status before sending stronger signals.".to_string()
-        },
+        verified,
+        agent_hint,
         accelerator_summary,
     })
+}
+
+async fn reconfirm_signaled(
+    process_match: &str,
+    signaled: &[CleanupProcess],
+    wait_ms: u64,
+) -> Result<bool> {
+    let signaled_pids = signaled
+        .iter()
+        .map(|process| process.pid)
+        .collect::<BTreeSet<_>>();
+    if signaled_pids.is_empty() {
+        return Ok(true);
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(wait_ms.max(1));
+    let poll = Duration::from_millis(150);
+    loop {
+        let remaining = scan_cleanup_processes(process_match)
+            .await?
+            .into_iter()
+            .any(|process| signaled_pids.contains(&process.pid));
+        if !remaining {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(poll.min(deadline.saturating_duration_since(Instant::now()))).await;
+    }
 }
 
 fn cleanup_skip_reason(process: &CleanupProcess, current_pid: i32) -> Option<&'static str> {
@@ -1178,4 +1260,15 @@ fn spawn_reader<R>(
         let mut target = output.lock().await;
         target.open_streams = target.open_streams.saturating_sub(1);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_elapsed_seconds;
+
+    #[test]
+    fn cleanup_elapsed_time_parses_ps_etime_formats() {
+        assert_eq!(parse_elapsed_seconds("01:23:45"), Some(5025));
+        assert_eq!(parse_elapsed_seconds("3-04:56:18"), Some(276_978));
+    }
 }

@@ -691,18 +691,14 @@ async fn nvidia_occupancy(
     state: &ServerState,
     want: &BTreeSet<i32>,
 ) -> ProcessCleanupAcceleratorSummary {
-    let Some(nvidia_smi) = state.nvidia_smi_path.as_ref() else {
-        return ProcessCleanupAcceleratorSummary {
-            kind: AcceleratorKind::Gpu,
-            available: false,
-            reason: Some("nvidia-smi path not configured".to_string()),
-            processes: Vec::new(),
-        };
-    };
+    let nvidia_smi = state
+        .nvidia_smi_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("nvidia-smi"));
     let gpu_output = match run_nvidia_smi(
-        nvidia_smi,
+        &nvidia_smi,
         &[
-            "--query-gpu=index,name,uuid",
+            "--query-gpu=index,name,uuid,memory.total",
             "--format=csv,noheader,nounits",
         ],
     )
@@ -718,22 +714,50 @@ async fn nvidia_occupancy(
             };
         }
     };
-    // Index is field 0, uuid is field 2. Lines with fewer fields are skipped;
-    // real nvidia-smi always emits at least index,name,uuid here.
+    if !gpu_output.status.success() {
+        return ProcessCleanupAcceleratorSummary {
+            kind: AcceleratorKind::Gpu,
+            available: false,
+            reason: Some(format!(
+                "nvidia-smi gpu query exited {}",
+                gpu_output.status.code().unwrap_or(-1)
+            )),
+            processes: Vec::new(),
+        };
+    }
+    // Real nvidia-smi returns index,name,uuid,memory.total for this query.
+    // Existing tests use the fuller accelerator-status mock row, so accept
+    // both shapes and take total memory from the status row's field 4 when present.
+    let mut uuid_to_device: BTreeMap<String, (u32, Option<String>, Option<u64>)> = BTreeMap::new();
     let mut uuid_to_index: BTreeMap<String, u32> = BTreeMap::new();
     for line in String::from_utf8_lossy(&gpu_output.stdout).lines() {
         let fields = parse_csv_line(line);
-        if fields.len() < 3 {
+        if fields.len() < 4 {
             continue;
         }
         if let (Some(index), Some(uuid)) =
             (parse_u32_field(&fields[0]), parse_string_field(&fields[2]))
         {
-            uuid_to_index.insert(uuid, index);
+            let device_name = parse_string_field(&fields[1]);
+            let memory_total_mib = if fields.len() >= 9 {
+                parse_u64_field(&fields[4])
+            } else {
+                parse_u64_field(&fields[3])
+            };
+            uuid_to_index.insert(uuid.clone(), index);
+            uuid_to_device.insert(uuid, (index, device_name, memory_total_mib));
         }
     }
+    if uuid_to_device.is_empty() {
+        return ProcessCleanupAcceleratorSummary {
+            kind: AcceleratorKind::Gpu,
+            available: false,
+            reason: Some("nvidia-smi returned no GPU devices".to_string()),
+            processes: Vec::new(),
+        };
+    }
     let proc_output = match run_nvidia_smi(
-        nvidia_smi,
+        &nvidia_smi,
         &[
             "--query-compute-apps=gpu_uuid,pid,used_memory",
             "--format=csv,noheader,nounits",
@@ -751,6 +775,17 @@ async fn nvidia_occupancy(
             };
         }
     };
+    if !proc_output.status.success() {
+        return ProcessCleanupAcceleratorSummary {
+            kind: AcceleratorKind::Gpu,
+            available: false,
+            reason: Some(format!(
+                "nvidia-smi process query exited {}",
+                proc_output.status.code().unwrap_or(-1)
+            )),
+            processes: Vec::new(),
+        };
+    }
     let processes = parse_nvidia_compute_processes(
         &String::from_utf8_lossy(&proc_output.stdout),
         &uuid_to_index,
@@ -758,10 +793,20 @@ async fn nvidia_occupancy(
     let filtered = processes
         .into_iter()
         .filter(|process| want.contains(&process.pid))
-        .map(|process| ProcessCleanupAcceleratorProcess {
-            pid: process.pid,
-            device_index: process.gpu_index,
-            used_memory_mib: process.used_memory_mib,
+        .map(|process| {
+            let device = process
+                .gpu_uuid
+                .as_ref()
+                .and_then(|uuid| uuid_to_device.get(uuid));
+            ProcessCleanupAcceleratorProcess {
+                pid: process.pid,
+                device_index: process
+                    .gpu_index
+                    .or_else(|| device.map(|(index, _, _)| *index)),
+                device_name: device.and_then(|(_, name, _)| name.clone()),
+                used_memory_mib: process.used_memory_mib,
+                memory_total_mib: device.and_then(|(_, _, total)| *total),
+            }
         })
         .collect();
     ProcessCleanupAcceleratorSummary {
@@ -776,15 +821,11 @@ async fn huawei_npu_occupancy(
     state: &ServerState,
     want: &BTreeSet<i32>,
 ) -> ProcessCleanupAcceleratorSummary {
-    let Some(npu_smi) = state.npu_smi_path.as_ref() else {
-        return ProcessCleanupAcceleratorSummary {
-            kind: AcceleratorKind::Npu,
-            available: false,
-            reason: Some("npu-smi path not configured".to_string()),
-            processes: Vec::new(),
-        };
-    };
-    let usage_output = match run_npu_smi(npu_smi, &["info"]).await {
+    let npu_smi = state
+        .npu_smi_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("npu-smi"));
+    let usage_output = match run_npu_smi(&npu_smi, &["info"]).await {
         Ok(output) => output,
         Err(error) => {
             return ProcessCleanupAcceleratorSummary {
@@ -806,14 +847,32 @@ async fn huawei_npu_occupancy(
             processes: Vec::new(),
         };
     }
-    let processes = parse_huawei_npu_processes(&String::from_utf8_lossy(&usage_output.stdout));
+    let output_text = String::from_utf8_lossy(&usage_output.stdout);
+    let devices = parse_huawei_npu_devices(&output_text)
+        .into_iter()
+        .map(|device| (device.index, device))
+        .collect::<BTreeMap<_, _>>();
+    if devices.is_empty() {
+        return ProcessCleanupAcceleratorSummary {
+            kind: AcceleratorKind::Npu,
+            available: false,
+            reason: Some("npu-smi returned no NPU devices".to_string()),
+            processes: Vec::new(),
+        };
+    }
+    let processes = parse_huawei_npu_processes(&output_text);
     let filtered = processes
         .into_iter()
         .filter(|process| want.contains(&process.pid))
-        .map(|process| ProcessCleanupAcceleratorProcess {
-            pid: process.pid,
-            device_index: process.gpu_index,
-            used_memory_mib: process.used_memory_mib,
+        .map(|process| {
+            let device = process.gpu_index.and_then(|index| devices.get(&index));
+            ProcessCleanupAcceleratorProcess {
+                pid: process.pid,
+                device_index: process.gpu_index,
+                device_name: device.map(|device| device.name.clone()),
+                used_memory_mib: process.used_memory_mib,
+                memory_total_mib: device.and_then(|device| device.memory_total_mib),
+            }
         })
         .collect();
     ProcessCleanupAcceleratorSummary {

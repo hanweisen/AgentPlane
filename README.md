@@ -473,11 +473,10 @@ signal when `--kill --signal TERM|KILL` is explicit.
   --text
 ```
 
-Add `--reconfirm` to a `--kill` run so the client polls the matcher again afterwards and reports
-which signaled processes are still alive, instead of requiring a separate `--dry-run` to check.
-The settle window is bounded by `--reconfirm-wait-ms` (default 2000). The JSON output gains a
-`remaining` array (subset of `signaled` still matched) and `reconfirm_ok` (`remaining` is empty);
-text mode prints a `Reconfirm:` verdict line.
+After a `--kill`, the server automatically polls the matcher again and sets the JSON `verified`
+field when every signaled PID has exited. The settle window is bounded by
+`--reconfirm-wait-ms` (default 2000 ms, with a server-side maximum); text mode prints a
+`Reconfirm:` verdict line. Use `--no-reconfirm` only when the caller cannot wait for verification.
 
 ```bash
 ./agentplane process-cleanup \
@@ -485,16 +484,15 @@ text mode prints a `Reconfirm:` verdict line.
   --token "$AP_TOKEN" \
   --match 'service-name|worker-name' \
   --kill \
-  --signal TERM \
-  --reconfirm
+  --signal TERM
 ```
 
-Add `--accelerator-summary gpu|npu` to a `--dry-run` to attach per-PID accelerator occupancy (device
-index + device memory) for the matched processes, so a residual `xgl|vllm|mooncake|msprof|nsys`
-report shows what each process holds before you decide to kill. The summary is server-side (it runs
-`nvidia-smi` / `npu-smi`), degrades to `available: false` with a `reason` if the provider is missing,
-and only lists PIDs that are both matched and reported by the provider as holding device memory.
-Ignored for `--kill`.
+Add `--accelerator-summary gpu|npu` to a `--dry-run` to attach per-PID accelerator occupancy
+(device index/name plus used/total device memory) for the matched processes, so a residual
+`xgl|vllm|mooncake|msprof|nsys` report shows what each process holds before you decide to kill.
+The summary is server-side (it runs `nvidia-smi` / `npu-smi`), degrades to `available: false`
+with a `reason` and warning when the provider is missing or fails, and only lists PIDs that are
+both matched and reported by the provider as holding device memory. Ignored for `--kill`.
 
 ```bash
 ./agentplane process-cleanup \

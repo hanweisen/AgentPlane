@@ -584,6 +584,8 @@ async fn process_cleanup_dry_run_attaches_gpu_occupancy_for_matched_pids() -> Re
                     dry_run: true,
                     kill: false,
                     signal: None,
+                    reconfirm: false,
+                    reconfirm_wait_ms: None,
                     accelerator_summary: Some(AcceleratorKind::Gpu),
                 },
             )
@@ -617,7 +619,67 @@ async fn process_cleanup_dry_run_attaches_gpu_occupancy_for_matched_pids() -> Re
                     .find(|process| process.pid == child_pid)
                     .expect("child occupancy present");
                 assert_eq!(child_occ.device_index, Some(0));
+                assert_eq!(child_occ.device_name.as_deref(), Some("NVIDIA A800"));
                 assert_eq!(child_occ.used_memory_mib, Some(256));
+                assert_eq!(child_occ.memory_total_mib, Some(81920));
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("cleanup dry-run never matched child pid {child_pid}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[tokio::test]
+async fn process_cleanup_dry_run_uses_default_gpu_smi_path() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let marker = format!("accel_cleanup_default_smi_{}", std::process::id());
+    let mut child = Command::new("python3")
+        .args(["-c", "import time; time.sleep(30)", &marker])
+        .spawn()?;
+    let child_pid = child.id() as i32;
+
+    let result: Result<()> = async {
+        let state = ServerState::new(
+            "test-token".to_string(),
+            vec![remote_root.path().to_path_buf()],
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let response = handle_process_cleanup(
+                &state,
+                ProcessCleanupRequest {
+                    process_match: marker.clone(),
+                    dry_run: true,
+                    kill: false,
+                    signal: None,
+                    reconfirm: false,
+                    reconfirm_wait_ms: None,
+                    accelerator_summary: Some(AcceleratorKind::Gpu),
+                },
+            )
+            .await?;
+            if response
+                .matched
+                .iter()
+                .any(|process| process.pid == child_pid)
+            {
+                let summary = response
+                    .accelerator_summary
+                    .as_ref()
+                    .expect("accelerator_summary should be attached");
+                assert_ne!(
+                    summary.reason.as_deref(),
+                    Some("nvidia-smi path not configured")
+                );
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -670,6 +732,8 @@ async fn process_cleanup_dry_run_attaches_npu_occupancy_for_matched_pids() -> Re
                     dry_run: true,
                     kill: false,
                     signal: None,
+                    reconfirm: false,
+                    reconfirm_wait_ms: None,
                     accelerator_summary: Some(AcceleratorKind::Npu),
                 },
             )
@@ -688,7 +752,9 @@ async fn process_cleanup_dry_run_attaches_npu_occupancy_for_matched_pids() -> Re
                 assert_eq!(summary.processes.len(), 1);
                 assert_eq!(summary.processes[0].pid, child_pid);
                 assert_eq!(summary.processes[0].device_index, Some(0));
+                assert_eq!(summary.processes[0].device_name.as_deref(), Some("910B"));
                 assert_eq!(summary.processes[0].used_memory_mib, Some(2048));
+                assert_eq!(summary.processes[0].memory_total_mib, Some(65536));
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -723,6 +789,8 @@ async fn process_cleanup_dry_run_omits_summary_by_default() -> Result<()> {
             dry_run: true,
             kill: false,
             signal: None,
+            reconfirm: false,
+            reconfirm_wait_ms: None,
             accelerator_summary: None,
         },
     )
@@ -734,14 +802,19 @@ async fn process_cleanup_dry_run_omits_summary_by_default() -> Result<()> {
 }
 
 #[tokio::test]
-async fn process_cleanup_dry_run_summary_reports_unavailable_when_smi_missing() -> Result<()> {
+async fn process_cleanup_dry_run_skips_smi_when_no_processes_match() -> Result<()> {
     let remote_root = tempfile::tempdir()?;
+    let invoked = remote_root.path().join("smi-invoked");
+    let mock = remote_root.path().join("nvidia-smi");
+    write_mock_nvidia_smi(
+        &mock,
+        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", invoked.display()),
+    )?;
     let mut state = ServerState::new(
         "test-token".to_string(),
         vec![remote_root.path().to_path_buf()],
     );
-    // Point at a path that does not exist; occupancy must degrade gracefully.
-    state.nvidia_smi_path = Some(remote_root.path().join("missing-nvidia-smi"));
+    state.nvidia_smi_path = Some(mock);
 
     let response = handle_process_cleanup(
         &state,
@@ -750,6 +823,8 @@ async fn process_cleanup_dry_run_summary_reports_unavailable_when_smi_missing() 
             dry_run: true,
             kill: false,
             signal: None,
+            reconfirm: false,
+            reconfirm_wait_ms: None,
             accelerator_summary: Some(AcceleratorKind::Gpu),
         },
     )
@@ -757,9 +832,203 @@ async fn process_cleanup_dry_run_summary_reports_unavailable_when_smi_missing() 
     let summary = response
         .accelerator_summary
         .as_ref()
-        .expect("summary should still be attached when unavailable");
-    assert!(!summary.available);
-    assert!(summary.reason.is_some());
+        .expect("summary should be attached for an empty match set");
+    assert!(summary.available);
+    assert!(summary.reason.is_none());
     assert!(summary.processes.is_empty());
+    assert!(
+        !invoked.exists(),
+        "nvidia-smi should not run for no matches"
+    );
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_process_cleanup_reports_gpu_occupancy_in_json_and_text() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let marker = format!("cli_accel_cleanup_{}", std::process::id());
+    let mut child = Command::new("python3")
+        .args(["-c", "import time; time.sleep(30)", &marker])
+        .spawn()?;
+    let child_pid = child.id() as i64;
+
+    let result = (|| -> Result<()> {
+        let mock = remote_root.path().join("nvidia-smi");
+        write_mock_nvidia_smi(
+            &mock,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --query-gpu=*)\n    printf '%s\\n' '0, NVIDIA A800, GPU-zero, 128, 81920, 7, P0, 101.50, 42'\n    ;;\n  --query-compute-apps=*)\n    printf '%s\\n' 'GPU-zero, {child_pid}, 256'\n    ;;\n  *) exit 1 ;;\nesac\n"
+            ),
+        )?;
+        let mock_arg = mock.display().to_string();
+        let harness = CliServerHarness::start_with_args(
+            remote_root.path(),
+            token,
+            &["--nvidia-smi-path", &mock_arg],
+        )?;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let body = loop {
+            let output = run_cli(&[
+                "process-cleanup",
+                "--server",
+                &harness.base_url,
+                "--token",
+                token,
+                "--match",
+                &marker,
+                "--dry-run",
+                "--accelerator-summary",
+                "gpu",
+                "--json",
+            ])?;
+            assert!(
+                output.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let body: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            if body["matched"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|process| process["pid"].as_i64() == Some(child_pid))
+            {
+                break body;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("cleanup CLI never matched child pid {child_pid}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        assert_eq!(body["accelerator_summary"]["available"], true);
+        assert_eq!(
+            body["accelerator_summary"]["processes"][0]["pid"],
+            child_pid
+        );
+        assert_eq!(
+            body["accelerator_summary"]["processes"][0]["device_name"],
+            "NVIDIA A800"
+        );
+        assert_eq!(
+            body["accelerator_summary"]["processes"][0]["used_memory_mib"],
+            256
+        );
+        assert_eq!(
+            body["accelerator_summary"]["processes"][0]["memory_total_mib"],
+            81920
+        );
+
+        let text = run_cli(&[
+            "process-cleanup",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--match",
+            &marker,
+            "--dry-run",
+            "--accelerator-summary",
+            "gpu",
+            "--text",
+        ])?;
+        assert!(text.status.success());
+        let stdout = String::from_utf8(text.stdout)?;
+        assert!(stdout.contains("Accelerator summary: GPU, 1 process(es)"));
+        assert!(stdout.contains(&format!("pid={child_pid} device=0")));
+        assert!(stdout.contains("device_name=NVIDIA A800"));
+        assert!(stdout.contains("used_memory=256 MiB total_memory=81920 MiB"));
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_process_cleanup_warns_when_gpu_summary_is_unavailable() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let token = "test-token";
+    let marker = format!("cli_accel_unavailable_{}", std::process::id());
+    let mut child = Command::new("python3")
+        .args(["-c", "import time; time.sleep(30)", &marker])
+        .spawn()?;
+    let child_pid = child.id() as i64;
+
+    let result = (|| -> Result<()> {
+        let missing = remote_root.path().join("missing-nvidia-smi");
+        let missing_arg = missing.display().to_string();
+        let harness = CliServerHarness::start_with_args(
+            remote_root.path(),
+            token,
+            &["--nvidia-smi-path", &missing_arg],
+        )?;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let body = loop {
+            let output = run_cli(&[
+                "process-cleanup",
+                "--server",
+                &harness.base_url,
+                "--token",
+                token,
+                "--match",
+                &marker,
+                "--dry-run",
+                "--accelerator-summary",
+                "gpu",
+                "--json",
+            ])?;
+            assert!(output.status.success());
+            let body: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            if body["matched"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|process| process["pid"].as_i64() == Some(child_pid))
+            {
+                break body;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("cleanup CLI never matched child pid {child_pid}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        assert_eq!(body["accelerator_summary"]["available"], false);
+        assert!(
+            body["agent_hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("WARNING: Accelerator status unavailable")
+        );
+
+        let text = run_cli(&[
+            "process-cleanup",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--match",
+            &marker,
+            "--dry-run",
+            "--accelerator-summary",
+            "gpu",
+            "--text",
+        ])?;
+        assert!(text.status.success());
+        let stdout = String::from_utf8(text.stdout)?;
+        assert!(stdout.contains("Accelerator summary: GPU unavailable"));
+        assert!(stdout.contains("WARNING: Accelerator status unavailable"));
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }

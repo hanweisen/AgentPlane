@@ -224,6 +224,12 @@ pub struct ProcessCleanupRequest {
     pub kill: bool,
     #[serde(default)]
     pub signal: Option<String>,
+    /// When true on a kill request, the server polls the matcher after
+    /// signaling and sets `verified` according to whether signaled PIDs exited.
+    #[serde(default)]
+    pub reconfirm: bool,
+    #[serde(default)]
+    pub reconfirm_wait_ms: Option<u64>,
     /// When set on a dry-run, the server attaches an accelerator occupancy
     /// summary (per-PID device + memory) of the given kind. Ignored for --kill.
     #[serde(default)]
@@ -238,6 +244,10 @@ pub struct ProcessCleanupResponse {
     pub matched: Vec<CleanupProcess>,
     pub signaled: Vec<CleanupProcess>,
     pub skipped: Vec<CleanupProcess>,
+    /// True only when a kill request requested reconfirmation and all signaled
+    /// PIDs were absent from the bounded follow-up scan.
+    #[serde(default)]
+    pub verified: bool,
     pub agent_hint: String,
     /// Present only when a dry-run requested an accelerator occupancy summary.
     /// `available: false` means the provider could not be queried.
@@ -260,7 +270,11 @@ pub struct ProcessCleanupAcceleratorSummary {
 pub struct ProcessCleanupAcceleratorProcess {
     pub pid: i32,
     pub device_index: Option<u32>,
+    #[serde(default)]
+    pub device_name: Option<String>,
     pub used_memory_mib: Option<u64>,
+    #[serde(default)]
+    pub memory_total_mib: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -270,6 +284,8 @@ pub struct CleanupProcess {
     pub process_group_id: Option<i32>,
     pub session_id: Option<i32>,
     pub elapsed: Option<String>,
+    #[serde(default)]
+    pub elapsed_seconds: Option<u64>,
     pub stat: Option<String>,
     pub user: Option<String>,
     pub command: Option<String>,
