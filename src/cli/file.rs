@@ -239,7 +239,7 @@ pub(super) async fn file_upload(args: FileUploadArgs, profile: &ClientProfile) -
 
     let mode = args
         .mode
-        .or_else(|| if args.preserve_mode { local_mode } else { None });
+        .or(if args.preserve_mode { local_mode } else { None });
     let remote_root_string = remote_root.display().to_string();
     let sync_session = if let Some(lock_key) = args.lock_key.as_deref() {
         Some(acquire_sync_session(&auth, &remote_root_string, Some(lock_key)).await?)

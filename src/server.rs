@@ -194,6 +194,7 @@ pub async fn serve_with_config(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_config_and_accelerators(
     listen: String,
     port: u16,

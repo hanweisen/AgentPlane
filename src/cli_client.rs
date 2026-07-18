@@ -386,6 +386,10 @@ fn format_error_chain(error: &reqwest::Error) -> String {
     message
 }
 
+pub(crate) fn normalize_server_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalize_socks5_proxy_url;
@@ -403,8 +407,4 @@ mod tests {
         );
         Ok(())
     }
-}
-
-pub(crate) fn normalize_server_url(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
 }

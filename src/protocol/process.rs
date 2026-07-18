@@ -50,6 +50,7 @@ pub(crate) struct ProcessStartConfig<'a> {
 }
 
 impl<'a> ProcessStartConfig<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         remote_root: &'a str,
         cwd: &'a str,
@@ -78,6 +79,7 @@ impl<'a> ProcessStartConfig<'a> {
 }
 
 impl ProcessStartRequest {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn matches_existing_normalized_config(
         &self,
         existing: &ProcessStartConfig<'_>,
