@@ -19,19 +19,19 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.package }}
+    name: Build agentplane-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - package: agentplane-linux-x86_64
+          - platform: linux-x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - package: agentplane-linux-aarch64
+          - platform: linux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - package: agentplane-macos-arm64
+          - platform: macos-arm64
             runner: macos-latest
             target: aarch64-apple-darwin
 
@@ -65,7 +65,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package="${{ matrix.package }}"
+          tag="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          package="agentplane-${tag}-${{ matrix.platform }}"
           target="${{ matrix.target }}"
           mkdir -p "dist/${package}"
           cp "target/${target}/release/agentplane" "dist/${package}/agentplane"
@@ -77,10 +81,10 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.package }}
+          name: agentplane-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}-${{ matrix.platform }}
           path: |
-            ${{ matrix.package }}.tar.gz
-            ${{ matrix.package }}.tar.gz.sha256
+            agentplane-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}-${{ matrix.platform }}.tar.gz
+            agentplane-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}-${{ matrix.platform }}.tar.gz.sha256
           if-no-files-found: error
 
   release:
