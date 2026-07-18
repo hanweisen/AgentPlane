@@ -1241,19 +1241,22 @@ AP_REMOTE_ROOT={}
         ),
     )?;
 
-    let output = run_cli(&[
-        "--profile",
-        &profile_path.display().to_string(),
-        "process-run",
-        "--process-id",
-        "cli-process-run",
-        "--wait-ms",
-        "100",
-        "--",
-        "bash",
-        "-lc",
-        "printf 'run-ok\\n'; exit 7",
-    ])?;
+    let output = run_cli_with_env(
+        &[
+            "--profile",
+            &profile_path.display().to_string(),
+            "process-run",
+            "--process-id",
+            "cli-process-run",
+            "--wait-ms",
+            "100",
+            "--",
+            "bash",
+            "-lc",
+            "printf 'run-ok\\n'; exit 7",
+        ],
+        &[("AP_PROCESS_TRANSPORT", "websocket")],
+    )?;
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(String::from_utf8(output.stdout)?, "run-ok\n");
     assert!(output.stderr.is_empty());
@@ -1273,6 +1276,28 @@ fn cli_process_help_recommends_run_vs_start_usage() -> Result<()> {
     let run_stdout = String::from_utf8(run_help.stdout)?;
     assert!(run_stdout.contains("Use process-run for short build/check commands"));
     assert!(run_stdout.contains("Use process-start for long-running producers"));
+    assert!(!run_stdout.contains("--transport"));
+    Ok(())
+}
+
+#[test]
+fn cli_process_transport_env_rejects_invalid_value() -> Result<()> {
+    let output = run_cli_with_env(
+        &[
+            "process-run",
+            "--server",
+            "http://127.0.0.1:1",
+            "--token",
+            "test-token",
+            "--process-id",
+            "invalid-transport",
+            "--",
+            "true",
+        ],
+        &[("AP_PROCESS_TRANSPORT", "invalid")],
+    )?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("invalid AP_PROCESS_TRANSPORT"));
     Ok(())
 }
 

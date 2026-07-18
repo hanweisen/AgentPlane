@@ -3,6 +3,7 @@ mod file;
 mod health;
 mod mode;
 mod process;
+mod process_stream;
 mod run;
 mod server;
 mod sync;
@@ -917,6 +918,54 @@ enum AgentModeArg {
 enum AcceleratorKindArg {
     Gpu,
     Npu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessStreamTransportArg {
+    Auto,
+    Http,
+    Websocket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadTransportArg {
+    Auto,
+    Json,
+    Binary,
+}
+
+fn process_stream_transport_from_env() -> Result<ProcessStreamTransportArg> {
+    match std::env::var("AP_PROCESS_TRANSPORT") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(ProcessStreamTransportArg::Auto),
+            "http" => Ok(ProcessStreamTransportArg::Http),
+            "websocket" => Ok(ProcessStreamTransportArg::Websocket),
+            _ => anyhow::bail!(
+                "invalid AP_PROCESS_TRANSPORT value {value:?}; expected auto, http, or websocket"
+            ),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(ProcessStreamTransportArg::Auto),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("AP_PROCESS_TRANSPORT must be valid UTF-8")
+        }
+    }
+}
+
+fn upload_transport_from_env() -> Result<UploadTransportArg> {
+    match std::env::var("AP_UPLOAD_TRANSPORT") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(UploadTransportArg::Auto),
+            "json" => Ok(UploadTransportArg::Json),
+            "binary" => Ok(UploadTransportArg::Binary),
+            _ => anyhow::bail!(
+                "invalid AP_UPLOAD_TRANSPORT value {value:?}; expected auto, json, or binary"
+            ),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(UploadTransportArg::Auto),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("AP_UPLOAD_TRANSPORT must be valid UTF-8")
+        }
+    }
 }
 
 pub async fn run() -> Result<ExitCode> {

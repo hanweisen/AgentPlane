@@ -5,7 +5,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -24,9 +26,10 @@ mod util;
 pub use self::accelerator::handle_accelerator_status;
 pub use self::file::{
     handle_file_delete, handle_file_find, handle_file_list, handle_file_read, handle_file_stat,
-    handle_file_upload_abort, handle_file_upload_chunk, handle_file_upload_finish,
-    handle_file_upload_init, handle_file_upload_status, handle_file_write, handle_sync_run,
-    handle_sync_session_init, handle_sync_session_release, handle_sync_session_status,
+    handle_file_upload_abort, handle_file_upload_chunk, handle_file_upload_chunk_bytes,
+    handle_file_upload_finish, handle_file_upload_init, handle_file_upload_status,
+    handle_file_write, handle_sync_run, handle_sync_session_init, handle_sync_session_release,
+    handle_sync_session_status,
 };
 pub use self::process::{
     handle_process_cleanup, handle_process_get, handle_process_list, handle_process_read,
@@ -39,12 +42,13 @@ use crate::mode::ModeRegistry;
 use crate::protocol::{
     AcceleratorStatusRequest, FileDeleteRequest, FileFindRequest, FileListRequest, FileReadRequest,
     FileStatRequest, FileUploadAbortRequest, FileUploadChunkRequest, FileUploadFinishRequest,
-    FileUploadInitRequest, FileUploadStatusRequest, FileWriteRequest, LeaseReleaseRequest,
+    FileUploadInitRequest, FileUploadStatusRequest, FileWriteRequest, HEADER_UPLOAD_CHUNK_SHA256,
+    HEADER_UPLOAD_LOCK_TOKEN, HEADER_UPLOAD_SYNC_SESSION_ID, LeaseReleaseRequest,
     LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, ModeGetRequest, ModeGetResponse,
-    ModeSwitchRequest, ModeSwitchResponse, ProcessCleanupRequest, ProcessGetRequest,
-    ProcessListRequest, ProcessReadRequest, ProcessStartRequest, ProcessTerminateRequest,
-    ProcessWriteRequest, SimpleResponse, SyncPayload, SyncSessionInitRequest,
-    SyncSessionReleaseRequest, SyncSessionStatusRequest,
+    ModeSwitchRequest, ModeSwitchResponse, ProcessCleanupRequest, ProcessEventMessage,
+    ProcessEventSubscribeRequest, ProcessGetRequest, ProcessListRequest, ProcessReadRequest,
+    ProcessStartRequest, ProcessTerminateRequest, ProcessWriteRequest, SimpleResponse, SyncPayload,
+    SyncSessionInitRequest, SyncSessionReleaseRequest, SyncSessionStatusRequest,
 };
 
 const DEFAULT_PROCESS_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
@@ -56,6 +60,9 @@ const MAX_PROCESS_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROCESS_READ_MAX_BYTES: usize = 1024 * 1024;
 const MAX_PROCESS_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_ZOMBIE_TTL_SECONDS: u64 = 600;
+const PROCESS_EVENT_WAIT_MS: u64 = 15_000;
+const PROCESS_EVENT_SUBSCRIBE_TIMEOUT_SECONDS: u64 = 10;
+const MAX_RAW_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum TlsMode {
@@ -226,6 +233,7 @@ pub async fn serve_with_config_and_accelerators(
         .route("/v1/process/get", post(process_get))
         .route("/v1/process/list", post(process_list))
         .route("/v1/process/read", post(process_read))
+        .route("/v1/events", get(process_events))
         .route("/v1/process/write", post(process_write))
         .route("/v1/process/terminate", post(process_terminate))
         .route("/v1/process/cleanup", post(process_cleanup))
@@ -234,6 +242,10 @@ pub async fn serve_with_config_and_accelerators(
         .route("/v1/file/write", post(file_write))
         .route("/v1/file/upload/init", post(file_upload_init))
         .route("/v1/file/upload/chunk", post(file_upload_chunk))
+        .route(
+            "/v1/file/upload/chunk/raw/{upload_id}/{offset}",
+            post(file_upload_chunk_raw).layer(DefaultBodyLimit::max(MAX_RAW_UPLOAD_CHUNK_BYTES)),
+        )
         .route("/v1/file/upload/status", post(file_upload_status))
         .route("/v1/file/upload/finish", post(file_upload_finish))
         .route("/v1/file/upload/abort", post(file_upload_abort))
@@ -475,6 +487,92 @@ async fn process_read(
     }
 }
 
+async fn process_events(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    websocket
+        .on_upgrade(move |socket| process_event_stream(state, socket))
+        .into_response()
+}
+
+async fn process_event_stream(state: Arc<ServerState>, mut socket: WebSocket) {
+    let first_message = tokio::time::timeout(
+        std::time::Duration::from_secs(PROCESS_EVENT_SUBSCRIBE_TIMEOUT_SECONDS),
+        socket.recv(),
+    )
+    .await;
+    let subscription = match first_message {
+        Ok(Some(Ok(Message::Text(text)))) => {
+            serde_json::from_str::<ProcessEventSubscribeRequest>(&text)
+        }
+        _ => return,
+    };
+    let subscription = match subscription {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            let _ = send_process_event(
+                &mut socket,
+                &ProcessEventMessage::Error {
+                    error: format!("invalid process event subscription: {error}"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let mut after_seq = subscription.after_seq;
+
+    loop {
+        let response = handle_process_read(
+            &state,
+            ProcessReadRequest {
+                process_id: subscription.process_id.clone(),
+                after_seq,
+                max_bytes: subscription.max_bytes,
+                wait_ms: Some(PROCESS_EVENT_WAIT_MS),
+            },
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = send_process_event(
+                    &mut socket,
+                    &ProcessEventMessage::Error {
+                        error: error.to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+        after_seq = Some(response.next_seq);
+        let exited = response.exited;
+        if send_process_event(&mut socket, &ProcessEventMessage::Read { response })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if exited {
+            return;
+        }
+    }
+}
+
+async fn send_process_event(socket: &mut WebSocket, event: &ProcessEventMessage) -> Result<()> {
+    let text = serde_json::to_string(event)?;
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .context("failed to send process event")
+}
+
 async fn process_get(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -610,6 +708,37 @@ async fn file_upload_chunk(
         return unauthorized_response().into_response();
     }
     match file::handle_file_upload_chunk(&state, payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => bad_request_response(error).into_response(),
+    }
+}
+
+async fn file_upload_chunk_raw(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath((upload_id, offset)): AxumPath<(String, u64)>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return unauthorized_response().into_response();
+    }
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+    };
+    match file::handle_file_upload_chunk_bytes(
+        &state,
+        &upload_id,
+        offset,
+        &body,
+        header(HEADER_UPLOAD_CHUNK_SHA256),
+        header(HEADER_UPLOAD_SYNC_SESSION_ID),
+        header(HEADER_UPLOAD_LOCK_TOKEN),
+    )
+    .await
+    {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => bad_request_response(error).into_response(),
     }

@@ -74,6 +74,8 @@ jobs:
           mkdir -p "dist/${package}"
           cp "target/${target}/release/agentplane" "dist/${package}/agentplane"
           cp README.md "dist/${package}/README.md"
+          git archive --format=tar HEAD SKILL | tar -x -C "dist/${package}"
+          test -f "dist/${package}/SKILL/SKILL.md"
           chmod 755 "dist/${package}/agentplane"
           tar -C dist -czf "${package}.tar.gz" "${package}"
           shasum -a 256 "${package}.tar.gz" > "${package}.tar.gz.sha256"
@@ -98,6 +100,21 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+
+      - name: Validate release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          for archive in agentplane-*.tar.gz; do
+            package="${archive%.tar.gz}"
+            test -f "${archive}.sha256"
+            shasum -a 256 -c "${archive}.sha256"
+            tar -tzf "${archive}" | awk -v expected="${package}/SKILL/SKILL.md" '
+              $0 == expected { found = 1 }
+              END { exit !found }
+            '
+          done
 
       - name: Publish release
         shell: bash

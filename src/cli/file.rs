@@ -7,11 +7,13 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::StatusCode;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::cli_client::{
-    build_http_client, post_json, post_json_with_client, print_error_response,
+    build_http_client, normalize_server_url, post_json, post_json_with_client,
+    print_error_response, wrap_request_error,
 };
 use crate::config::{
     ClientProfile, ResolvedClientAuth, load_client_profile, resolve_profile_auth,
@@ -21,14 +23,15 @@ use crate::protocol::{
     FileDeleteRequest, FileFindRequest, FileListRequest, FileReadRequest, FileReadResponse,
     FileStatRequest, FileStatResponse, FileUploadChunkRequest, FileUploadChunkResponse,
     FileUploadFinishRequest, FileUploadInitRequest, FileUploadInitResponse,
-    FileUploadStatusRequest, FileUploadStatusResponse, FileWriteRequest, ProcessGetRequest,
-    SimpleResponse,
+    FileUploadStatusRequest, FileUploadStatusResponse, FileWriteRequest,
+    HEADER_UPLOAD_CHUNK_SHA256, HEADER_UPLOAD_LOCK_TOKEN, HEADER_UPLOAD_SYNC_SESSION_ID,
+    ProcessGetRequest, SimpleResponse,
 };
 
 use super::sync_session::{acquire_sync_session, release_sync_session};
 use super::{
     FileCopyArgs, FileDeleteArgs, FileFindArgs, FileListArgs, FileReadArgs, FileStatArgs,
-    FileUploadArgs, FileWaitArgs, FileWriteArgs,
+    FileUploadArgs, FileWaitArgs, FileWriteArgs, UploadTransportArg, upload_transport_from_env,
 };
 
 const FILE_WAIT_POLL_MS: u64 = 100;
@@ -211,6 +214,7 @@ pub(super) async fn file_write(args: FileWriteArgs, profile: &ClientProfile) -> 
 }
 
 pub(super) async fn file_upload(args: FileUploadArgs, profile: &ClientProfile) -> Result<ExitCode> {
+    let mut transport = upload_transport_from_env()?;
     let auth = args.auth.resolve(profile)?;
     let client = build_http_client(&auth)?;
     let remote_root = resolve_remote_root(args.remote_root.as_ref(), profile)?;
@@ -268,7 +272,6 @@ pub(super) async fn file_upload(args: FileUploadArgs, profile: &ClientProfile) -
                 .map(|session| session.lock_token.clone()),
         };
         let init = init_upload(&client, &auth, &init_payload).await?;
-
         let mut file = tokio::fs::File::open(&args.from_local)
             .await
             .with_context(|| format!("failed to open {}", args.from_local.display()))?;
@@ -290,20 +293,22 @@ pub(super) async fn file_upload(args: FileUploadArgs, profile: &ClientProfile) -
             let next_offset = offset
                 .checked_add(u64::try_from(read).context("chunk read overflow")?)
                 .ok_or_else(|| anyhow::anyhow!("upload offset overflow"))?;
-            let chunk_payload = FileUploadChunkRequest {
-                upload_id: init.upload_id.clone(),
+            let response = upload_chunk_with_recovery(
+                &client,
+                &auth,
+                &init.upload_id,
                 offset,
-                data_b64: BASE64.encode(chunk),
-                chunk_checksum_sha256: Some(sha256_hex(chunk)),
-                sync_session_id: sync_session
+                chunk,
+                sync_session
                     .as_ref()
-                    .map(|session| session.sync_session_id.clone()),
-                lock_token: sync_session
+                    .map(|session| session.sync_session_id.as_str()),
+                sync_session
                     .as_ref()
-                    .map(|session| session.lock_token.clone()),
-            };
-            let response =
-                upload_chunk_with_recovery(&client, &auth, &chunk_payload, next_offset).await?;
+                    .map(|session| session.lock_token.as_str()),
+                &mut transport,
+                next_offset,
+            )
+            .await?;
             offset = response.received_bytes;
         }
 
@@ -341,6 +346,7 @@ pub(super) async fn file_upload(args: FileUploadArgs, profile: &ClientProfile) -
 }
 
 pub(super) async fn file_copy(args: FileCopyArgs, _profile: &ClientProfile) -> Result<ExitCode> {
+    let transport = upload_transport_from_env()?;
     if args.chunk_size == 0 {
         bail!("--chunk-size must be greater than zero");
     }
@@ -385,6 +391,7 @@ pub(super) async fn file_copy(args: FileCopyArgs, _profile: &ClientProfile) -> R
     let to_client = build_http_client(&to_auth)?;
     let options = UploadBytesOptions {
         chunk_size: args.chunk_size,
+        transport,
         resume: false,
         executable: false,
         create_parents: true,
@@ -442,6 +449,7 @@ pub(super) async fn file_copy(args: FileCopyArgs, _profile: &ClientProfile) -> R
 
 pub(super) struct UploadBytesOptions {
     pub chunk_size: usize,
+    pub transport: UploadTransportArg,
     pub resume: bool,
     pub executable: bool,
     pub create_parents: bool,
@@ -487,23 +495,21 @@ pub(super) async fn upload_bytes(
         lock_token: options.lock_token.clone(),
     };
     let init = init_upload(client, auth, &init_payload).await?;
+    let mut transport = options.transport;
 
     let mut offset = usize::try_from(init.received_bytes).context("upload offset is too large")?;
     while offset < content.len() {
         let next_offset = offset.saturating_add(options.chunk_size).min(content.len());
         let chunk = &content[offset..next_offset];
-        let chunk_payload = FileUploadChunkRequest {
-            upload_id: init.upload_id.clone(),
-            offset: u64::try_from(offset).context("upload offset is too large")?,
-            data_b64: BASE64.encode(chunk),
-            chunk_checksum_sha256: Some(sha256_hex(chunk)),
-            sync_session_id: options.sync_session_id.clone(),
-            lock_token: options.lock_token.clone(),
-        };
         let response = upload_chunk_with_recovery(
             client,
             auth,
-            &chunk_payload,
+            &init.upload_id,
+            u64::try_from(offset).context("upload offset is too large")?,
+            chunk,
+            options.sync_session_id.as_deref(),
+            options.lock_token.as_deref(),
+            &mut transport,
             u64::try_from(next_offset).context("upload offset is too large")?,
         )
         .await?;
@@ -603,16 +609,57 @@ async fn init_upload(
     Err(anyhow::anyhow!(response.text().await?))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_chunk_with_recovery(
     client: &reqwest::Client,
     auth: &ResolvedClientAuth,
-    payload: &FileUploadChunkRequest,
+    upload_id: &str,
+    offset: u64,
+    data: &[u8],
+    sync_session_id: Option<&str>,
+    lock_token: Option<&str>,
+    transport: &mut UploadTransportArg,
     expected_next_offset: u64,
 ) -> Result<FileUploadChunkResponse> {
     let max_attempts = auth.connect_retries.saturating_add(1);
     let mut last_error = None;
-    for attempt in 0..max_attempts {
-        match post_json_with_client(client, auth, "/v1/file/upload/chunk", payload, false).await {
+    let checksum = sha256_hex(data);
+    let mut attempt = 0;
+    while attempt < max_attempts {
+        let used_auto_binary = *transport == UploadTransportArg::Auto;
+        let response = match *transport {
+            UploadTransportArg::Auto | UploadTransportArg::Binary => {
+                post_raw_upload_chunk(
+                    client,
+                    auth,
+                    upload_id,
+                    offset,
+                    data,
+                    &checksum,
+                    sync_session_id,
+                    lock_token,
+                )
+                .await
+            }
+            UploadTransportArg::Json => {
+                post_json_with_client(
+                    client,
+                    auth,
+                    "/v1/file/upload/chunk",
+                    &FileUploadChunkRequest {
+                        upload_id: upload_id.to_string(),
+                        offset,
+                        data_b64: BASE64.encode(data),
+                        chunk_checksum_sha256: Some(checksum.clone()),
+                        sync_session_id: sync_session_id.map(ToOwned::to_owned),
+                        lock_token: lock_token.map(ToOwned::to_owned),
+                    },
+                    false,
+                )
+                .await
+            }
+        };
+        match response {
             Ok(response) => {
                 if response.status() == StatusCode::OK {
                     let body: FileUploadChunkResponse = response.json().await?;
@@ -622,9 +669,19 @@ async fn upload_chunk_with_recovery(
                             body.received_bytes
                         );
                     }
+                    if used_auto_binary {
+                        *transport = UploadTransportArg::Binary;
+                    }
                     return Ok(body);
                 }
-                last_error = Some(anyhow::anyhow!(response.text().await?));
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                last_error = Some(anyhow::anyhow!(
+                    "upload chunk failed with status {status}: {text}"
+                ));
+                if used_auto_binary && status == StatusCode::PAYLOAD_TOO_LARGE {
+                    return Err(last_error.take().expect("raw upload error was recorded"));
+                }
             }
             Err(error) => {
                 last_error = Some(error);
@@ -635,9 +692,9 @@ async fn upload_chunk_with_recovery(
             client,
             auth,
             &FileUploadStatusRequest {
-                upload_id: payload.upload_id.clone(),
-                sync_session_id: payload.sync_session_id.clone(),
-                lock_token: payload.lock_token.clone(),
+                upload_id: upload_id.to_string(),
+                sync_session_id: sync_session_id.map(ToOwned::to_owned),
+                lock_token: lock_token.map(ToOwned::to_owned),
             },
         )
         .await;
@@ -649,9 +706,7 @@ async fn upload_chunk_with_recovery(
                     received_bytes: status.received_bytes,
                 });
             }
-            if status.received_bytes > payload.offset
-                && status.received_bytes < expected_next_offset
-            {
+            if status.received_bytes > offset && status.received_bytes < expected_next_offset {
                 bail!(
                     "upload resumed at unexpected intermediate offset {}",
                     status.received_bytes
@@ -659,11 +714,50 @@ async fn upload_chunk_with_recovery(
             }
         }
 
-        if attempt + 1 < max_attempts {
+        if used_auto_binary {
+            *transport = UploadTransportArg::Json;
+            continue;
+        }
+
+        attempt += 1;
+        if attempt < max_attempts {
             tokio::time::sleep(Duration::from_millis(auth.connect_retry_delay_ms)).await;
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("upload chunk failed")))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn post_raw_upload_chunk(
+    client: &reqwest::Client,
+    auth: &ResolvedClientAuth,
+    upload_id: &str,
+    offset: u64,
+    data: &[u8],
+    checksum: &str,
+    sync_session_id: Option<&str>,
+    lock_token: Option<&str>,
+) -> Result<reqwest::Response> {
+    let url = format!(
+        "{}/v1/file/upload/chunk/raw/{upload_id}/{offset}",
+        normalize_server_url(&auth.server)
+    );
+    let mut request = client
+        .post(url)
+        .header(AUTHORIZATION, format!("Bearer {}", auth.token))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(HEADER_UPLOAD_CHUNK_SHA256, checksum)
+        .body(data.to_vec());
+    if let Some(sync_session_id) = sync_session_id {
+        request = request.header(HEADER_UPLOAD_SYNC_SESSION_ID, sync_session_id);
+    }
+    if let Some(lock_token) = lock_token {
+        request = request.header(HEADER_UPLOAD_LOCK_TOKEN, lock_token);
+    }
+    request
+        .send()
+        .await
+        .map_err(|error| wrap_request_error(error, &auth.server, auth.socks5_hostname.as_deref()))
 }
 
 async fn read_upload_status(
@@ -757,5 +851,164 @@ fn local_file_mode(path: &Path) -> Result<Option<u32>> {
     {
         let _ = path;
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct LegacyUploadState {
+        raw_calls: Arc<AtomicUsize>,
+        json_calls: Arc<AtomicUsize>,
+    }
+
+    #[tokio::test]
+    async fn auto_upload_falls_back_to_json_when_raw_route_is_missing() -> Result<()> {
+        let state = LegacyUploadState::default();
+        let observed = state.clone();
+        let app = Router::new()
+            .route(
+                "/v1/file/upload/chunk/raw/{upload_id}/{offset}",
+                post(|State(state): State<LegacyUploadState>| async move {
+                    state.raw_calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NOT_FOUND
+                }),
+            )
+            .route(
+                "/v1/file/upload/status",
+                post(|| async {
+                    Json(FileUploadStatusResponse {
+                        ok: true,
+                        upload_id: "legacy-upload".to_string(),
+                        received_bytes: 0,
+                        total_size: 3,
+                        path: "legacy.bin".to_string(),
+                    })
+                }),
+            )
+            .route(
+                "/v1/file/upload/chunk",
+                post(
+                    |State(state): State<LegacyUploadState>,
+                     Json(payload): Json<FileUploadChunkRequest>| async move {
+                        state.json_calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(payload.upload_id, "legacy-upload");
+                        assert_eq!(payload.offset, 0);
+                        assert_eq!(payload.data_b64, BASE64.encode(b"abc"));
+                        Json(FileUploadChunkResponse {
+                            ok: true,
+                            upload_id: payload.upload_id,
+                            received_bytes: 3,
+                        })
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let auth = ResolvedClientAuth {
+            server: format!("http://{address}"),
+            token: "test-token".to_string(),
+            socks5_hostname: None,
+            request_timeout_seconds: 5,
+            connect_retries: 0,
+            connect_retry_delay_ms: 0,
+            tls_ca_cert: None,
+            tls_insecure_skip_verify: false,
+            header: Vec::new(),
+            agent_id: "test-agent".to_string(),
+        };
+        let client = build_http_client(&auth)?;
+        let mut transport = UploadTransportArg::Auto;
+
+        let response = upload_chunk_with_recovery(
+            &client,
+            &auth,
+            "legacy-upload",
+            0,
+            b"abc",
+            None,
+            None,
+            &mut transport,
+            3,
+        )
+        .await?;
+        server.abort();
+
+        assert_eq!(response.received_bytes, 3);
+        assert_eq!(transport, UploadTransportArg::Json);
+        assert_eq!(observed.raw_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.json_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_upload_does_not_expand_raw_413_into_json() -> Result<()> {
+        let state = LegacyUploadState::default();
+        let observed = state.clone();
+        let app = Router::new()
+            .route(
+                "/v1/file/upload/chunk/raw/{upload_id}/{offset}",
+                post(|State(state): State<LegacyUploadState>| async move {
+                    state.raw_calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }),
+            )
+            .route(
+                "/v1/file/upload/chunk",
+                post(|State(state): State<LegacyUploadState>| async move {
+                    state.json_calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let auth = ResolvedClientAuth {
+            server: format!("http://{address}"),
+            token: "test-token".to_string(),
+            socks5_hostname: None,
+            request_timeout_seconds: 5,
+            connect_retries: 0,
+            connect_retry_delay_ms: 0,
+            tls_ca_cert: None,
+            tls_insecure_skip_verify: false,
+            header: Vec::new(),
+            agent_id: "test-agent".to_string(),
+        };
+        let client = build_http_client(&auth)?;
+        let mut transport = UploadTransportArg::Auto;
+
+        let error = upload_chunk_with_recovery(
+            &client,
+            &auth,
+            "oversized-upload",
+            0,
+            b"abc",
+            None,
+            None,
+            &mut transport,
+            3,
+        )
+        .await
+        .expect_err("raw 413 must not fall back to larger JSON/base64");
+        server.abort();
+
+        assert!(error.to_string().contains("413"));
+        assert_eq!(observed.raw_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.json_calls.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 }

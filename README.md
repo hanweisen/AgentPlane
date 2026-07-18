@@ -338,6 +338,15 @@ Read output incrementally:
   --text
 ```
 
+Add `--follow` to keep reading until exit. The client automatically attempts the authenticated
+`/v1/events` WebSocket (including configured gateway headers) and falls back to cursor-based HTTP
+reads if the upgrade is unsupported or the stream disconnects. SOCKS, custom CA, and insecure-TLS
+profiles automatically use HTTP.
+
+Transport selection is not a command option. For client diagnostics only, set
+`AP_PROCESS_TRANSPORT=auto|http|websocket` in the client process environment. The default is
+`auto`; `websocket` requires the upgrade and surfaces an error instead of falling back.
+
 If a network request times out, retry `process-start` with the same `--process-id` and the
 same arguments. AgentPlane will reconnect to the existing process instead of starting a
 duplicate command.
@@ -355,7 +364,7 @@ For long jobs, add `--save-output-path <relative-path>` to `process-start` or
 in-memory output buffer is truncated.
 
 For one-shot commands, `process-run` combines start/read/wait and returns the remote exit
-code as the local exit code:
+code as the local exit code. It uses the same automatic WebSocket-to-HTTP fallback:
 
 ```bash
 ./agentplane --profile /tmp/agentplane.env process-run \
@@ -546,9 +555,11 @@ Upload a large local file in chunks with resume support:
   --resume
 ```
 
-The default `--chunk-size` is 1048576 bytes (1 MiB), which stays under the
-server's default request body limit. Each chunk is base64-encoded in a JSON
-payload, so choose a smaller `--chunk-size` when a gateway imposes its own limit.
+The default `--chunk-size` is 1048576 bytes (1 MiB). The client automatically sends each chunk
+as `application/octet-stream`, then falls back to the original JSON/base64 route when an older
+server or gateway rejects the raw endpoint. A raw `413 Payload Too Large` is not retried as
+base64 because that request would be larger; choose a smaller chunk instead. For client
+diagnostics only, set `AP_UPLOAD_TRANSPORT=auto|json|binary` in the client process environment.
 
 Use `--lock-key <KEY>` when multiple agents may upload the same logical artifact and should
 fail fast instead of racing on the same target. If the client dies mid-upload, rerun with
@@ -573,7 +584,8 @@ and the destination uploads in chunks through the same transport as `file-upload
 `--chunk-size` sizes the chunked upload (default 1048576), `--atomic` writes the destination
 atomically, and `--checksum` stats the destination after the copy and verifies its SHA-256
 matches the source. Only single files are supported in this version; the source is pulled with
-`file-read`, so very large sources are bounded by that single-response transport.
+`file-read`, so very large sources are bounded by that single-response transport. Destination
+uploads select their transport automatically; downloads remain JSON/base64 in this version.
 
 Wait for generated output:
 
@@ -726,6 +738,7 @@ The server defaults are conservative for shared remote machines and workspaces:
 - hard max per-process output retention: `8 MiB`
 - default `process-read` payload cap: `64 KiB`
 - hard max `process-read` payload cap: `1 MiB`
+- hard max raw upload chunk body: `8 MiB`
 - max single `process-write` stdin payload: `64 KiB`
 - max process timeout: `24h`
 - exited process retention TTL: `600s`

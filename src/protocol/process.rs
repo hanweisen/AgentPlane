@@ -190,6 +190,20 @@ pub struct ProcessReadResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessEventSubscribeRequest {
+    pub process_id: String,
+    pub after_seq: Option<u64>,
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProcessEventMessage {
+    Read { response: ProcessReadResponse },
+    Error { error: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessOutputChunk {
     pub seq: u64,
     pub stream: ProcessOutputStream,

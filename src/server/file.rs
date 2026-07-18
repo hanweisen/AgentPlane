@@ -447,32 +447,54 @@ pub async fn handle_file_upload_chunk(
     state: &ServerState,
     payload: FileUploadChunkRequest,
 ) -> Result<FileUploadChunkResponse> {
-    let session = get_upload_session(state, &payload.upload_id).await?;
-    validate_upload_session_lock(
-        state,
-        &session,
-        &payload.sync_session_id,
-        &payload.lock_token,
-    )
-    .await?;
     let data = BASE64
         .decode(payload.data_b64.as_bytes())
         .context("failed to decode base64 upload chunk")?;
-    if let Some(chunk_checksum_sha256) = payload.chunk_checksum_sha256.as_deref() {
+    handle_file_upload_chunk_bytes(
+        state,
+        &payload.upload_id,
+        payload.offset,
+        &data,
+        payload.chunk_checksum_sha256.as_deref(),
+        payload.sync_session_id.as_deref(),
+        payload.lock_token.as_deref(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_file_upload_chunk_bytes(
+    state: &ServerState,
+    upload_id: &str,
+    offset: u64,
+    data: &[u8],
+    chunk_checksum_sha256: Option<&str>,
+    sync_session_id: Option<&str>,
+    lock_token: Option<&str>,
+) -> Result<FileUploadChunkResponse> {
+    let session = get_upload_session(state, upload_id).await?;
+    validate_upload_session_lock(
+        state,
+        &session,
+        &sync_session_id.map(ToOwned::to_owned),
+        &lock_token.map(ToOwned::to_owned),
+    )
+    .await?;
+    if let Some(chunk_checksum_sha256) = chunk_checksum_sha256 {
         let chunk_checksum_sha256 = normalize_sha256(chunk_checksum_sha256);
         validate_sha256(&chunk_checksum_sha256)?;
-        let actual = sha256_hex(&data);
+        let actual = sha256_hex(data);
         if !actual.eq_ignore_ascii_case(&chunk_checksum_sha256) {
             bail!("upload chunk checksum mismatch for {}", session.path);
         }
     }
     let current_size = upload_current_size(&session).await?;
-    if current_size != payload.offset {
+    if current_size != offset {
         bail!(
             "upload offset mismatch for {}: expected {}, got {}",
             session.path,
             current_size,
-            payload.offset
+            offset
         );
     }
     let next_size = current_size
@@ -491,7 +513,7 @@ pub async fn handle_file_upload_chunk(
         .open(&session.staging_path)
         .await
         .with_context(|| format!("failed to open {}", session.staging_path.display()))?;
-    file.write_all(&data)
+    file.write_all(data)
         .await
         .with_context(|| format!("failed to append {}", session.staging_path.display()))?;
     file.flush().await?;

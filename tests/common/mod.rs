@@ -148,6 +148,14 @@ pub fn run_cli(args: &[&str]) -> Result<std::process::Output> {
     Ok(Command::new(binary).args(args).output()?)
 }
 
+pub fn run_cli_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<std::process::Output> {
+    let binary = build_binary()?;
+    Ok(Command::new(binary)
+        .args(args)
+        .envs(env.iter().copied())
+        .output()?)
+}
+
 pub fn wait_for_health(base_url: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {

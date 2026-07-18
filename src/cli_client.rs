@@ -55,9 +55,19 @@ pub(crate) async fn post_process_start_with_recovery(
     auth: &ResolvedClientAuth,
     payload: &ProcessStartRequest,
 ) -> Result<ProcessStartResponse> {
+    let client = build_http_client(auth)?;
+    post_process_start_with_recovery_with_client(&client, auth, payload).await
+}
+
+pub(crate) async fn post_process_start_with_recovery_with_client(
+    client: &Client,
+    auth: &ResolvedClientAuth,
+    payload: &ProcessStartRequest,
+) -> Result<ProcessStartResponse> {
     let max_attempts = auth.connect_retries.saturating_add(1);
     for attempt in 0..max_attempts {
-        let response = post_json(auth, "/v1/process/start", payload, false).await;
+        let response =
+            post_json_with_client(client, auth, "/v1/process/start", payload, false).await;
         match response {
             Ok(response) => {
                 let status = response.status();
@@ -67,7 +77,7 @@ pub(crate) async fn post_process_start_with_recovery(
                 }
                 if should_retry_response_status(status) {
                     if let Some(recovered) =
-                        try_recover_existing_process_start(auth, payload).await?
+                        try_recover_existing_process_start(client, auth, payload).await?
                     {
                         return Ok(recovered);
                     }
@@ -84,7 +94,9 @@ pub(crate) async fn post_process_start_with_recovery(
                 if !is_retryable_process_start_transport_error(&error) {
                     return Err(error);
                 }
-                if let Some(recovered) = try_recover_existing_process_start(auth, payload).await? {
+                if let Some(recovered) =
+                    try_recover_existing_process_start(client, auth, payload).await?
+                {
                     return Ok(recovered);
                 }
                 let has_more_attempts = attempt + 1 < max_attempts;
@@ -286,10 +298,11 @@ pub(crate) fn wrap_request_error(
 }
 
 async fn try_recover_existing_process_start(
+    client: &Client,
     auth: &ResolvedClientAuth,
     payload: &ProcessStartRequest,
 ) -> Result<Option<ProcessStartResponse>> {
-    let fetched = fetch_process_info(auth, &payload.process_id).await?;
+    let fetched = fetch_process_info(client, auth, &payload.process_id).await?;
     let Some(process) = fetched else {
         return Ok(None);
     };
@@ -305,13 +318,14 @@ async fn try_recover_existing_process_start(
 }
 
 async fn fetch_process_info(
+    client: &Client,
     auth: &ResolvedClientAuth,
     process_id: &str,
 ) -> Result<Option<ProcessGetResponse>> {
     let payload = ProcessGetRequest {
         process_id: process_id.to_string(),
     };
-    let response = post_json(auth, "/v1/process/get", &payload, true).await?;
+    let response = post_json_with_client(client, auth, "/v1/process/get", &payload, true).await?;
     if response.status() == StatusCode::OK {
         let body: ProcessGetResponse = response.json().await?;
         return Ok(Some(body));

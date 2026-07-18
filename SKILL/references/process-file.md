@@ -12,7 +12,7 @@ Load this when exact process/file commands are needed.
 ## Process Choice
 
 Use `process-run` for short commands whose remote exit code should become the local exit
-code:
+code. The client automatically selects WebSocket output or HTTP cursor reads:
 
 ```bash
 "$AP_BIN" process-run \
@@ -51,6 +51,11 @@ Read logs incrementally:
   --max-bytes 262144 \
   --wait-ms 30000
 ```
+
+For one blocking follow operation, add `--follow --text`. The client tries WebSocket and resumes
+through HTTP with the last `next_seq` if the upgrade or stream fails. SOCKS/custom-CA/insecure-TLS
+profiles automatically use HTTP. For transport diagnosis only, set the client environment variable
+`AP_PROCESS_TRANSPORT=auto|http|websocket`; do not add transport selection to routine commands.
 
 Resume with the prior response's `next_seq`:
 
@@ -99,6 +104,11 @@ SHA256="$(shasum -a 256 "$LOCAL_PATH" | awk '{print $1}')"
   --checksum "$SHA256" \
   --chunk-size 1048576
 ```
+
+Upload automatically prefers raw `application/octet-stream` chunks and falls back to JSON/base64
+for compatibility. On an upstream HTML or AgentPlane 413, lower `--chunk-size`; do not retry the
+larger base64 form. For transport diagnosis only, set the client environment variable
+`AP_UPLOAD_TRANSPORT=auto|json|binary`; do not add transport selection to routine commands.
 
 Wait for producer output:
 

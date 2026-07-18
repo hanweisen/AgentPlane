@@ -86,5 +86,14 @@ Keep each request/response comfortably below gateway limits:
 - read logs incrementally with `after_seq` and small `max_bytes`
 - fetch summaries first, then fetch details only if needed
 
-If the operation is too large, ask the user to provide another channel or split the work.
+Process follow/run automatically forwards configured gateway headers in the WebSocket upgrade and
+falls back to HTTP cursor reads on rejection or disconnect. Do not assume a successful health
+request proves WebSocket support. For diagnosis only, set `AP_PROCESS_TRANSPORT=websocket` to
+require an upgrade or `AP_PROCESS_TRANSPORT=http` to bypass it.
 
+File uploads automatically prefer raw fixed-size HTTP chunks with JSON/base64 fallback. A raw 413
+is not retried as larger base64; lower `--chunk-size`. For diagnosis only, set
+`AP_UPLOAD_TRANSPORT=json` when a gateway accepts only JSON bodies, and distinguish an AgentPlane
+JSON 413 from an upstream HTML proxy response.
+
+If the operation is too large, ask the user to provide another channel or split the work.

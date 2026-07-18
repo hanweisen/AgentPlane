@@ -17,6 +17,7 @@ pub use file::{
     FileUploadAbortRequest, FileUploadChunkRequest, FileUploadChunkResponse,
     FileUploadFinishRequest, FileUploadInitRequest, FileUploadInitResponse,
     FileUploadStatusRequest, FileUploadStatusResponse, FileWrite, FileWriteRequest,
+    HEADER_UPLOAD_CHUNK_SHA256, HEADER_UPLOAD_LOCK_TOKEN, HEADER_UPLOAD_SYNC_SESSION_ID,
 };
 pub use mode::{
     AgentLease, AgentMode, HEADER_AGENT_MODE, HEADER_LEASE_ID, HEADER_TASK_ID, LeaseReleaseRequest,
@@ -26,8 +27,9 @@ pub use mode::{
 pub(crate) use process::ProcessStartConfig;
 pub use process::{
     CleanupProcess, ProcessCleanupAcceleratorProcess, ProcessCleanupAcceleratorSummary,
-    ProcessCleanupRequest, ProcessCleanupResponse, ProcessGetRequest, ProcessGetResponse,
-    ProcessInfo, ProcessListRequest, ProcessListResponse, ProcessOutputChunk, ProcessOutputStream,
+    ProcessCleanupRequest, ProcessCleanupResponse, ProcessEventMessage,
+    ProcessEventSubscribeRequest, ProcessGetRequest, ProcessGetResponse, ProcessInfo,
+    ProcessListRequest, ProcessListResponse, ProcessOutputChunk, ProcessOutputStream,
     ProcessReadRequest, ProcessReadResponse, ProcessStartRequest, ProcessStartResponse,
     ProcessTerminateRequest, ProcessWriteRequest,
 };

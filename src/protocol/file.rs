@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub const HEADER_UPLOAD_CHUNK_SHA256: &str = "x-agentplane-upload-chunk-sha256";
+pub const HEADER_UPLOAD_SYNC_SESSION_ID: &str = "x-agentplane-upload-sync-session-id";
+pub const HEADER_UPLOAD_LOCK_TOKEN: &str = "x-agentplane-upload-lock-token";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileWrite {
     pub path: String,

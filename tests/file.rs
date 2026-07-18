@@ -10,9 +10,10 @@ use agentplane::protocol::{
 };
 use agentplane::server::{
     ServerState, handle_file_delete, handle_file_find, handle_file_list, handle_file_read,
-    handle_file_stat, handle_file_upload_chunk, handle_file_upload_finish, handle_file_upload_init,
-    handle_file_upload_status, handle_file_write, handle_sync_session_init,
-    handle_sync_session_release, handle_sync_session_status,
+    handle_file_stat, handle_file_upload_chunk, handle_file_upload_chunk_bytes,
+    handle_file_upload_finish, handle_file_upload_init, handle_file_upload_status,
+    handle_file_write, handle_sync_session_init, handle_sync_session_release,
+    handle_sync_session_status,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -334,16 +335,14 @@ async fn file_upload_resume_round_trip_preserves_content_and_mode() -> Result<()
     assert_eq!(status.received_bytes, 5);
 
     let second = &content[5..];
-    handle_file_upload_chunk(
+    handle_file_upload_chunk_bytes(
         &state,
-        FileUploadChunkRequest {
-            upload_id: init.upload_id.clone(),
-            offset: 5,
-            data_b64: BASE64.encode(second),
-            chunk_checksum_sha256: Some(test_sha256_hex(second)),
-            sync_session_id: None,
-            lock_token: None,
-        },
+        &init.upload_id,
+        5,
+        second,
+        Some(&test_sha256_hex(second)),
+        None,
+        None,
     )
     .await?;
     handle_file_upload_finish(
@@ -918,29 +917,32 @@ fn cli_file_upload_transfers_large_local_file_in_chunks() -> Result<()> {
     std::fs::write(&local_upload, content)?;
     let checksum = test_sha256_hex(content);
 
-    let file_upload = run_cli(&[
-        "file-upload",
-        "--server",
-        &harness.base_url,
-        "--token",
-        token,
-        "--remote-root",
-        &remote_root.path().display().to_string(),
-        "--path",
-        "nested/chunked.bin",
-        "--from-local",
-        &local_upload.display().to_string(),
-        "--chunk-size",
-        "7",
-        "--atomic",
-        "--mode",
-        "700",
-        "--checksum",
-        &format!("sha256:{checksum}"),
-        "--resume",
-        "--lock-key",
-        "nested/chunked.bin",
-    ])?;
+    let file_upload = run_cli_with_env(
+        &[
+            "file-upload",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--remote-root",
+            &remote_root.path().display().to_string(),
+            "--path",
+            "nested/chunked.bin",
+            "--from-local",
+            &local_upload.display().to_string(),
+            "--chunk-size",
+            "7",
+            "--atomic",
+            "--mode",
+            "700",
+            "--checksum",
+            &format!("sha256:{checksum}"),
+            "--resume",
+            "--lock-key",
+            "nested/chunked.bin",
+        ],
+        &[("AP_UPLOAD_TRANSPORT", "binary")],
+    )?;
     assert!(file_upload.status.success());
 
     let file_read = run_cli(&[
@@ -976,6 +978,14 @@ fn cli_file_upload_transfers_large_local_file_in_chunks() -> Result<()> {
     let file_stat_body: serde_json::Value = serde_json::from_slice(&file_stat.stdout)?;
     assert_eq!(file_stat_body["sha256"], checksum);
     assert!(file_stat_body["executable"].as_bool().unwrap_or(false));
+    Ok(())
+}
+
+#[test]
+fn cli_file_upload_help_hides_transport_selection() -> Result<()> {
+    let output = run_cli(&["file-upload", "--help"])?;
+    assert!(output.status.success());
+    assert!(!String::from_utf8(output.stdout)?.contains("--transport"));
     Ok(())
 }
 
@@ -1099,25 +1109,28 @@ fn cli_file_upload_default_chunk_size_handles_large_file() -> Result<()> {
     std::fs::write(&local_upload, &content)?;
     let checksum = test_sha256_hex(&content);
 
-    let file_upload = run_cli(&[
-        "file-upload",
-        "--server",
-        &harness.base_url,
-        "--token",
-        token,
-        "--remote-root",
-        &remote_root.path().display().to_string(),
-        "--path",
-        "nested/default-chunk.bin",
-        "--from-local",
-        &local_upload.display().to_string(),
-        "--atomic",
-        "--checksum",
-        &format!("sha256:{checksum}"),
-        "--resume",
-        "--lock-key",
-        "nested/default-chunk.bin",
-    ])?;
+    let file_upload = run_cli_with_env(
+        &[
+            "file-upload",
+            "--server",
+            &harness.base_url,
+            "--token",
+            token,
+            "--remote-root",
+            &remote_root.path().display().to_string(),
+            "--path",
+            "nested/default-chunk.bin",
+            "--from-local",
+            &local_upload.display().to_string(),
+            "--atomic",
+            "--checksum",
+            &format!("sha256:{checksum}"),
+            "--resume",
+            "--lock-key",
+            "nested/default-chunk.bin",
+        ],
+        &[("AP_UPLOAD_TRANSPORT", "json")],
+    )?;
     assert!(
         file_upload.status.success(),
         "file-upload with default chunk size failed: {}",

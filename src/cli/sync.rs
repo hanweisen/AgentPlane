@@ -25,7 +25,7 @@ use crate::protocol::{
 
 use super::file::{UploadBytesOptions, upload_bytes};
 use super::sync_session::{acquire_sync_session, release_sync_session};
-use super::{SyncInitArgs, SyncRunArgs};
+use super::{SyncInitArgs, SyncRunArgs, upload_transport_from_env};
 
 pub(super) async fn sync_run(args: SyncRunArgs, profile: &ClientProfile) -> Result<ExitCode> {
     let auth = args.auth.resolve(profile)?;
@@ -307,6 +307,7 @@ async fn preupload_sync_writes(
     }
 
     let client = build_http_client(auth)?;
+    let transport = upload_transport_from_env()?;
     for write in writes {
         let stat = read_remote_stat(&client, auth, remote_root, &write.path).await?;
         let content = BASE64
@@ -333,6 +334,7 @@ async fn preupload_sync_writes(
             &content,
             &UploadBytesOptions {
                 chunk_size,
+                transport,
                 resume: true,
                 executable: write.executable,
                 create_parents: true,

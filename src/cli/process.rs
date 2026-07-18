@@ -7,21 +7,24 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::StatusCode;
 
 use crate::cli_client::{
-    emit_error_body, post_json, post_process_start_with_recovery, print_error_response,
-    process_error_response,
+    build_http_client, emit_error_body, post_json, post_json_with_client,
+    post_process_start_with_recovery, post_process_start_with_recovery_with_client,
+    print_error_response, process_error_response,
 };
 use crate::config::{ClientProfile, ResolvedClientAuth, resolve_remote_root};
 use crate::protocol::{
     CleanupProcess, ProcessCleanupAcceleratorSummary, ProcessCleanupRequest,
-    ProcessCleanupResponse, ProcessGetRequest, ProcessGetResponse, ProcessListRequest,
-    ProcessListResponse, ProcessReadRequest, ProcessReadResponse, ProcessStartRequest,
-    ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest, SimpleResponse,
-    parse_resource_claim_specs,
+    ProcessCleanupResponse, ProcessEventSubscribeRequest, ProcessGetRequest, ProcessGetResponse,
+    ProcessListRequest, ProcessListResponse, ProcessReadRequest, ProcessReadResponse,
+    ProcessStartRequest, ProcessStartResponse, ProcessTerminateRequest, ProcessWriteRequest,
+    SimpleResponse, parse_resource_claim_specs,
 };
 
+use super::process_stream::ProcessEventClient;
 use super::{
     ProcessCleanupArgs, ProcessGetArgs, ProcessListArgs, ProcessReadArgs, ProcessRunArgs,
-    ProcessStartArgs, ProcessStatusArgs, ProcessTerminateArgs, ProcessWriteArgs,
+    ProcessStartArgs, ProcessStatusArgs, ProcessStreamTransportArg, ProcessTerminateArgs,
+    ProcessWriteArgs, process_stream_transport_from_env,
 };
 
 pub(super) async fn process_start(
@@ -214,7 +217,9 @@ fn print_process_info_text(info: &crate::protocol::ProcessInfo) {
 }
 
 pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -> Result<ExitCode> {
+    let transport = process_stream_transport_from_env()?;
     let auth = args.auth.resolve(profile)?;
+    let client = build_http_client(&auth)?;
     let remote_root = resolve_remote_root(args.remote_root.as_ref(), profile)?;
     let env = parse_process_env_pairs(&args.env)?;
     let claims = parse_resource_claim_specs(&args.claims)?;
@@ -236,15 +241,27 @@ pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -
         kill_tree_on_terminate: false,
         run_id: args.run_id.or_else(|| profile.run_id.clone()),
     };
-    let start = post_process_start_with_recovery(&auth, &start_payload).await?;
+    let start =
+        post_process_start_with_recovery_with_client(&client, &auth, &start_payload).await?;
     if !start.ok {
         println!("{}", serde_json::to_string_pretty(&start)?);
         return Ok(ExitCode::from(1));
     }
 
     let mut after_seq = None;
+    let mut event_client = connect_process_events(
+        transport,
+        &auth,
+        &args.process_id,
+        after_seq,
+        args.max_bytes,
+    )
+    .await?;
     loop {
-        let body = read_process_once(
+        let body = read_process_stream_once(
+            &mut event_client,
+            transport,
+            &client,
             &auth,
             &args.process_id,
             after_seq,
@@ -267,6 +284,7 @@ pub(super) async fn process_run(args: ProcessRunArgs, profile: &ClientProfile) -
                 && let Some(bytes) = args.tail_on_error
             {
                 print_process_tail_on_error(
+                    &client,
                     &auth,
                     &args.process_id,
                     body.available_from_seq,
@@ -289,8 +307,12 @@ pub(super) async fn process_read(
     if args.tail && after_seq.is_none() {
         after_seq = Some(fetch_process_next_seq(&auth, &args.process_id).await?);
     }
-
     if args.follow || args.text || args.tail {
+        let transport = if args.follow {
+            process_stream_transport_from_env()?
+        } else {
+            ProcessStreamTransportArg::Http
+        };
         process_read_loop(
             auth,
             args.process_id,
@@ -299,6 +321,7 @@ pub(super) async fn process_read(
             args.wait_ms,
             args.text,
             args.follow,
+            transport,
         )
         .await
     } else {
@@ -560,6 +583,7 @@ async fn fetch_process_next_seq(auth: &ResolvedClientAuth, process_id: &str) -> 
     Ok(body["process"]["next_seq"].as_u64().unwrap_or(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_read_loop(
     auth: ResolvedClientAuth,
     process_id: String,
@@ -568,19 +592,56 @@ async fn process_read_loop(
     wait_ms: Option<u64>,
     text: bool,
     follow: bool,
+    transport: ProcessStreamTransportArg,
 ) -> Result<ExitCode> {
+    let client = build_http_client(&auth)?;
+    let mut event_client = if follow {
+        connect_process_events(transport, &auth, &process_id, after_seq, max_bytes).await?
+    } else {
+        None
+    };
     loop {
-        let payload = ProcessReadRequest {
-            process_id: process_id.clone(),
-            after_seq,
-            max_bytes,
-            wait_ms,
+        let body = if let Some(stream) = event_client.as_mut() {
+            match stream.next_read().await {
+                Ok(body) => body,
+                Err(_error) if transport == ProcessStreamTransportArg::Auto => {
+                    event_client = None;
+                    match request_process_read_for_cli(
+                        &client,
+                        &auth,
+                        &process_id,
+                        after_seq,
+                        max_bytes,
+                        wait_ms,
+                    )
+                    .await?
+                    {
+                        Ok(body) => body,
+                        Err(response) => {
+                            return print_process_read_error(response, &process_id, &auth.server)
+                                .await;
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            match request_process_read_for_cli(
+                &client,
+                &auth,
+                &process_id,
+                after_seq,
+                max_bytes,
+                wait_ms,
+            )
+            .await?
+            {
+                Ok(body) => body,
+                Err(response) => {
+                    return print_process_read_error(response, &process_id, &auth.server).await;
+                }
+            }
         };
-        let response = post_json(&auth, "/v1/process/read", &payload, true).await?;
-        if response.status() != StatusCode::OK {
-            return print_process_read_error(response, &process_id, &auth.server).await;
-        }
-        let body: ProcessReadResponse = response.json().await?;
         warn_if_cursor_expired(&body, None);
         if text {
             dump_process_chunks(&body)?;
@@ -594,7 +655,74 @@ async fn process_read_loop(
     }
 }
 
+async fn connect_process_events(
+    transport: ProcessStreamTransportArg,
+    auth: &ResolvedClientAuth,
+    process_id: &str,
+    after_seq: Option<u64>,
+    max_bytes: Option<usize>,
+) -> Result<Option<ProcessEventClient>> {
+    if transport == ProcessStreamTransportArg::Http {
+        return Ok(None);
+    }
+    let subscription = ProcessEventSubscribeRequest {
+        process_id: process_id.to_string(),
+        after_seq,
+        max_bytes,
+    };
+    match ProcessEventClient::connect(auth, &subscription).await {
+        Ok(client) => Ok(Some(client)),
+        Err(_) if transport == ProcessStreamTransportArg::Auto => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_process_stream_once(
+    event_client: &mut Option<ProcessEventClient>,
+    transport: ProcessStreamTransportArg,
+    client: &reqwest::Client,
+    auth: &ResolvedClientAuth,
+    process_id: &str,
+    after_seq: Option<u64>,
+    max_bytes: Option<usize>,
+    wait_ms: Option<u64>,
+) -> Result<ProcessReadResponse> {
+    if let Some(stream) = event_client.as_mut() {
+        match stream.next_read().await {
+            Ok(response) => return Ok(response),
+            Err(_error) if transport == ProcessStreamTransportArg::Auto => {
+                *event_client = None;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    read_process_once(client, auth, process_id, after_seq, max_bytes, wait_ms).await
+}
+
+async fn request_process_read_for_cli(
+    client: &reqwest::Client,
+    auth: &ResolvedClientAuth,
+    process_id: &str,
+    after_seq: Option<u64>,
+    max_bytes: Option<usize>,
+    wait_ms: Option<u64>,
+) -> Result<std::result::Result<ProcessReadResponse, reqwest::Response>> {
+    let payload = ProcessReadRequest {
+        process_id: process_id.to_string(),
+        after_seq,
+        max_bytes,
+        wait_ms,
+    };
+    let response = post_json_with_client(client, auth, "/v1/process/read", &payload, true).await?;
+    if response.status() == StatusCode::OK {
+        return Ok(Ok(response.json().await?));
+    }
+    Ok(Err(response))
+}
+
 async fn read_process_once(
+    client: &reqwest::Client,
     auth: &ResolvedClientAuth,
     process_id: &str,
     after_seq: Option<u64>,
@@ -607,7 +735,7 @@ async fn read_process_once(
         max_bytes,
         wait_ms,
     };
-    let response = post_json(auth, "/v1/process/read", &payload, true).await?;
+    let response = post_json_with_client(client, auth, "/v1/process/read", &payload, true).await?;
     if response.status() != StatusCode::OK {
         return Err(process_error_response(response).await);
     }
@@ -615,6 +743,7 @@ async fn read_process_once(
 }
 
 async fn print_process_tail_on_error(
+    client: &reqwest::Client,
     auth: &ResolvedClientAuth,
     process_id: &str,
     available_from_seq: u64,
@@ -630,7 +759,8 @@ async fn print_process_tail_on_error(
     // view loses. Read from available_from_seq (the oldest chunk still held by the
     // server) so this stays correct even when the true start was evicted.
     if head_bytes > 0 {
-        let head = read_process_head(auth, process_id, available_from_seq, head_bytes).await?;
+        let head =
+            read_process_head(client, auth, process_id, available_from_seq, head_bytes).await?;
         if !head.is_empty() {
             let label = if available_from_seq > 0 {
                 format!(
@@ -655,7 +785,7 @@ async fn print_process_tail_on_error(
     let max_bytes = Some(tail_bytes.clamp(1, 1024 * 1024));
     let mut retained = Vec::new();
     for _ in 0..10_000 {
-        let body = read_process_once(auth, process_id, after_seq, max_bytes, None).await?;
+        let body = read_process_once(client, auth, process_id, after_seq, max_bytes, None).await?;
         warn_if_cursor_expired(&body, None);
         append_process_chunk_bytes(&body, &mut retained)?;
         if retained.len() > tail_bytes {
@@ -686,6 +816,7 @@ async fn print_process_tail_on_error(
 /// Read up to `head_bytes` of the earliest retained output starting at
 /// `available_from_seq`. Returns at most `head_bytes` bytes.
 async fn read_process_head(
+    client: &reqwest::Client,
     auth: &ResolvedClientAuth,
     process_id: &str,
     available_from_seq: u64,
@@ -695,7 +826,7 @@ async fn read_process_head(
     let mut after_seq = Some(available_from_seq);
     let max_bytes = Some(head_bytes.clamp(1, 1024 * 1024));
     for _ in 0..1_000 {
-        let body = read_process_once(auth, process_id, after_seq, max_bytes, None).await?;
+        let body = read_process_once(client, auth, process_id, after_seq, max_bytes, None).await?;
         append_process_chunk_bytes(&body, &mut head)?;
         if head.len() >= head_bytes {
             head.truncate(head_bytes);
@@ -790,4 +921,52 @@ fn render_optional_i32(value: Option<i32>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "?".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Router;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn auto_stream_falls_back_when_websocket_upgrade_is_unavailable() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, Router::new()).await });
+        let auth = ResolvedClientAuth {
+            server: format!("http://{address}"),
+            token: "test-token".to_string(),
+            socks5_hostname: None,
+            request_timeout_seconds: 5,
+            connect_retries: 0,
+            connect_retry_delay_ms: 0,
+            tls_ca_cert: None,
+            tls_insecure_skip_verify: false,
+            header: Vec::new(),
+            agent_id: "test-agent".to_string(),
+        };
+
+        let auto = connect_process_events(
+            ProcessStreamTransportArg::Auto,
+            &auth,
+            "fallback-test",
+            None,
+            None,
+        )
+        .await?;
+        assert!(auto.is_none());
+        let strict = connect_process_events(
+            ProcessStreamTransportArg::Websocket,
+            &auth,
+            "fallback-test",
+            None,
+            None,
+        )
+        .await;
+        server.abort();
+
+        assert!(strict.is_err());
+        Ok(())
+    }
 }
