@@ -315,9 +315,24 @@ requires `--kill --signal TERM` or `--kill --signal KILL`; `--signal` by itself 
 rejected. Matching is case-insensitive substring matching against process commands, with
 `|` separating alternatives. Do not use broad matches such as `python`, `bash`, or `server`
 unless the user explicitly confirms the matched dry-run report. The server skips the
-AgentPlane server process and cleanup client commands if they match the search term.
-Local direct-server CLI E2E verification has covered dry-run no-signal behavior, missing
-signal rejection, explicit `TERM` cleanup, and self-protection.
+current AgentPlane server process and any `agentplane process-cleanup` client command if
+they match the search term.
+
+Kill requests use bounded server-side reconfirmation by default. Require `verified: true`
+before treating the signal as successful; use `--no-reconfirm` only when explicitly choosing
+not to wait. `elapsed_seconds` is available alongside `elapsed` for reliable process-age
+comparisons.
+
+Use `--accelerator-summary gpu|npu` on a dry-run to attach matched per-PID device index/name
+and used/total device memory. The summary is server-side and probes `nvidia-smi` / `npu-smi`
+by default even when no explicit binary path is configured. Treat `available: false` and the
+accompanying warning as an unknown occupancy state, not zero occupancy. After a kill, wait a
+few seconds and issue a new dry-run summary when device-memory release must be confirmed.
+
+Local direct-server CLI E2E verification covers dry-run no-signal behavior, missing-signal
+rejection, explicit `TERM` cleanup, default server-side reconfirmation, `--no-reconfirm`, GPU
+summary JSON/text output, unavailable-provider JSON/text warnings, and the default
+`nvidia-smi` / `npu-smi` path fallback when no explicit binary path is configured.
 
 For one remote command where you want decoded logs streamed until exit and the local CLI exit
 code to match the remote process, prefer `process-run`:
@@ -514,89 +529,32 @@ call those readiness helpers again unless the user says the environment changed.
 
 ### Shared mode and lease-backed resource claims
 
-Default mode is **single-agent**. Do not enable shared mode unless the user says multiple
-agents or shared resources are involved.
+Default mode is **single-agent**. Enable `shared` only when multiple agents or shared
+resources are involved, and restore the prior mode at the end unless the user says
+otherwise.
 
-In shared mode, command execution requires an active task lease. File-only operations still
-work normally, but `process-start` and `sync-run --command ...` must include the lease
-headers.
+In shared mode, `process-start` and `sync-run --command ...` require an active lease and
+the three lease headers: agent mode, task id, and lease id. File-only operations can run
+without a lease, but use the headers for agent-owned work when attribution matters.
 
-When a task must reserve a resource under shared mode, prefer explicit claims on the
-execution request, for example `--claim gpu:0`, `--claim gpu:0,1`, or `--claim port:6006`.
-Claims are enforced only while the lease stays active. Legacy GPU workflows that only set
-`CUDA_VISIBLE_DEVICES` still participate in GPU protection, but explicit claims are the
-correct path for workloads that pick resources internally instead of via environment
-variables.
+Use explicit claims such as `--claim gpu:0` or `--claim port:6006`. Claims protect resources
+only while the lease is active. If a lease expires or is released, the reservation
+disappears but old processes are not auto-terminated; inspect existing processes and
+accelerator state before taking over the resource.
 
-Acquire or recover a lease:
+For long tasks, set a sufficient TTL and renew before expiry. If renewal fails, stop
+launching commands with the stale lease; reacquire and inspect state first.
 
-```bash
-export AP_TASK_ID="${AP_TASK_ID:-task-$(date +%s)}"
-export AP_LEASE_ID="${AP_LEASE_ID:-$AP_TASK_ID-gpu}"
+Use distinct task ids, lease ids, and process ids per agent. Treat `reserved by active lease`
+as the expected conflict result and do not bypass it silently. Treat `process_id already
+exists` as the reconnect/idempotency guard and do not change the id unless a second
+execution is intentional.
 
-"$AP_BIN" mode-switch \
-  --server "$AP_SERVER" \
-  --token "$AP_TOKEN" \
-  --mode shared \
-  --task-id "$AP_TASK_ID" \
-  --lease-id "$AP_LEASE_ID" \
-  --ttl-seconds 300 \
-  --heartbeat-seconds 30 \
-  --max-renewals 20
-```
+At task end, terminate or explicitly hand off holder processes, release only your own lease,
+and restore `single` when this workflow enabled `shared`.
 
-Use these headers on execution requests while the lease is active:
-
-```bash
---header 'x-agentplane-agent-mode: shared' \
---header "x-agentplane-task-id: $AP_TASK_ID" \
---header "x-agentplane-lease-id: $AP_LEASE_ID"
-```
-
-Renew during long tasks:
-
-```bash
-"$AP_BIN" lease-renew \
-  --server "$AP_SERVER" \
-  --token "$AP_TOKEN" \
-  --task-id "$AP_TASK_ID" \
-  --lease-id "$AP_LEASE_ID"
-```
-
-Release at task boundary:
-
-```bash
-"$AP_BIN" lease-release \
-  --server "$AP_SERVER" \
-  --token "$AP_TOKEN" \
-  --task-id "$AP_TASK_ID" \
-  --lease-id "$AP_LEASE_ID"
-```
-
-Multi-agent rules:
-
-- use distinct `task_id`, `lease_id`, `process-id`, and preferably distinct worktree/cache
-  prefixes per agent
-- releasing one agent's lease must not be treated as permission to run without a lease while
-  other active leases remain
-- if a lease expires or is released, reacquire or renew before starting new commands
-- never retry a failed `process-start` with a different `process-id` unless the user wants a
-  second execution
-
-Example shared `process-start`:
-
-```bash
-"$AP_BIN" process-start \
-  --server "$AP_SERVER" \
-  --token "$AP_TOKEN" \
-  --remote-root "$AP_REMOTE_ROOT" \
-  --process-id "$AP_TASK_ID-build" \
-  --cwd "$AP_REMOTE_ROOT" \
-  --header 'x-agentplane-agent-mode: shared' \
-  --header "x-agentplane-task-id: $AP_TASK_ID" \
-  --header "x-agentplane-lease-id: $AP_LEASE_ID" \
-  -- bash -lc 'make build'
-```
+For exact acquire/renew/release commands, lease headers, conflict scenarios, and the
+validated three-agent 910B example, load `shared-mode-reference.md`.
 
 ### Sync modes
 
