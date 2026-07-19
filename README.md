@@ -470,6 +470,17 @@ Terminate the group:
   --tree
 ```
 
+For an AgentPlane-managed service, use `process-terminate` as the controlled stop path. It
+sends SIGTERM to the managed process first and escalates to SIGKILL only if it does not exit
+within the bounded grace window. `process-cleanup` is a broad orphan-matching tool; when a
+launcher and its application both match, it signals descendants before ancestors, but it is
+not a replacement for a service's lifecycle API.
+
+Every process and `sync-run --command` launched by the server runs in a session isolated from
+the AgentPlane server, so application-level process-group signals cannot terminate the control
+service. `--kill-tree-on-terminate` controls whether later termination targets that whole
+isolated group; it is not required for the isolation itself.
+
 For broad cleanup, preview first. `process-cleanup` is dry-run by default and only sends a
 signal when `--kill --signal TERM|KILL` is explicit.
 

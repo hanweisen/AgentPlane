@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use super::file::{resolve_cwd, resolve_remote_root, safe_join};
-use super::util::{parse_i32_field, unix_now_ms};
+use super::util::{configure_command_session, parse_i32_field, unix_now_ms};
 use super::{ServerLimits, ServerState};
 use crate::protocol::{
     CleanupProcess, ProcessCleanupRequest, ProcessCleanupResponse, ProcessGetRequest,
@@ -39,7 +40,6 @@ const SIGKILL: i32 = 9;
 
 #[cfg(unix)]
 unsafe extern "C" {
-    fn setsid() -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
@@ -642,9 +642,9 @@ pub async fn handle_process_cleanup(
     let mut signaled = Vec::new();
     if payload.kill {
         let signal = signal.expect("validated signal");
-        for process in &matched {
+        for process in cleanup_signal_targets(&matched) {
             send_cleanup_signal(process.pid, signal)?;
-            signaled.push(process.clone());
+            signaled.push(process);
         }
     }
 
@@ -743,10 +743,35 @@ fn cleanup_skip_reason(process: &CleanupProcess, current_pid: i32) -> Option<&'s
         return Some("AgentPlane server process");
     }
     let command = process.command.as_deref()?.to_ascii_lowercase();
+    if command.contains("agentplane server") {
+        return Some("AgentPlane server process");
+    }
     if command.contains("agentplane") && command.contains("process-cleanup") {
         return Some("AgentPlane cleanup client process");
     }
     None
+}
+
+fn cleanup_signal_targets(matched: &[CleanupProcess]) -> Vec<CleanupProcess> {
+    let parent_by_pid = matched
+        .iter()
+        .map(|process| (process.pid, process.ppid))
+        .collect::<BTreeMap<_, _>>();
+    let mut targets = matched.to_vec();
+    targets.sort_by_key(|process| {
+        let mut depth = 0usize;
+        let mut current = process.pid;
+        let mut visited = BTreeSet::new();
+        while let Some(Some(parent)) = parent_by_pid.get(&current) {
+            if !visited.insert(*parent) || !parent_by_pid.contains_key(parent) {
+                break;
+            }
+            depth += 1;
+            current = *parent;
+        }
+        (Reverse(depth), process.pid)
+    });
+    targets
 }
 
 async fn read_process_snapshot(
@@ -975,26 +1000,15 @@ async fn refresh_process_state(state: &ServerState, process: &mut ManagedProcess
 }
 
 fn configure_process_group(command: &mut Command, enabled: bool) -> Result<()> {
-    if !enabled {
-        return Ok(());
-    }
     #[cfg(unix)]
-    {
-        unsafe {
-            command.pre_exec(|| {
-                if setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        Ok(())
-    }
+    let _ = enabled;
     #[cfg(not(unix))]
     {
-        let _ = command;
-        bail!("--kill-tree-on-terminate is only supported on Unix platforms")
+        if enabled {
+            bail!("--kill-tree-on-terminate is only supported on Unix platforms");
+        }
     }
+    configure_command_session(command)
 }
 
 fn process_group_id(child: &Child, enabled: bool) -> Option<i32> {
@@ -1033,6 +1047,16 @@ async fn terminate_process(process: &mut ManagedProcess, tree: bool) {
         terminate_process_group(process_group_id, SIGKILL);
     }
     if let Some(child) = process.child.as_mut() {
+        #[cfg(unix)]
+        if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+            let _ = send_cleanup_signal(pid, SIGTERM);
+            if matches!(
+                timeout(Duration::from_millis(500), child.wait()).await,
+                Ok(Ok(_))
+            ) {
+                return;
+            }
+        }
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
@@ -1264,11 +1288,41 @@ fn spawn_reader<R>(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_elapsed_seconds;
+    use super::{cleanup_signal_targets, parse_elapsed_seconds};
+    use crate::protocol::CleanupProcess;
 
     #[test]
     fn cleanup_elapsed_time_parses_ps_etime_formats() {
         assert_eq!(parse_elapsed_seconds("01:23:45"), Some(5025));
         assert_eq!(parse_elapsed_seconds("3-04:56:18"), Some(276_978));
+    }
+
+    #[test]
+    fn cleanup_signals_matched_descendants_before_ancestors() {
+        let process = |pid, ppid| CleanupProcess {
+            pid,
+            ppid,
+            process_group_id: None,
+            session_id: None,
+            elapsed: None,
+            elapsed_seconds: None,
+            stat: None,
+            user: None,
+            command: None,
+            skip_reason: None,
+        };
+        let matched = vec![
+            process(10, Some(1)),
+            process(20, Some(10)),
+            process(30, Some(20)),
+            process(40, Some(1)),
+        ];
+
+        let ordered = cleanup_signal_targets(&matched)
+            .into_iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered, vec![30, 20, 10, 40]);
     }
 }

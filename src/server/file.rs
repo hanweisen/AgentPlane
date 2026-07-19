@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::ServerState;
 use super::auth::ExecutionLease;
+use super::util::configure_command_session;
 use crate::protocol::{
     CommandResult, FileDeleteRequest, FileFindRequest, FileFindResponse, FileListEntry,
     FileListRequest, FileListResponse, FileReadRequest, FileReadResponse, FileStatRequest,
@@ -1527,6 +1528,7 @@ async fn run_command(
     child.envs(env);
     child.stdout(std::process::Stdio::piped());
     child.stderr(std::process::Stdio::piped());
+    configure_command_session(&mut child)?;
 
     let mut child = match child.spawn().context("failed to spawn command") {
         Ok(child) => child,

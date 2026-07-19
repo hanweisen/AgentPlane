@@ -92,6 +92,15 @@ Kill requests use bounded server-side reconfirmation by default. Require `verifi
 before treating cleanup as successful; use `--no-reconfirm` only when explicitly choosing
 not to wait. `elapsed_seconds` is available for reliable process-age comparisons.
 
+For an AgentPlane-managed service, use `process-terminate` for controlled shutdown. It sends
+SIGTERM first and escalates to SIGKILL only after its bounded grace window. `process-cleanup`
+is broad orphan cleanup; if a launcher and application both match, it signals descendants
+before ancestors, but it is not a service lifecycle API.
+
+Server-launched processes and `sync-run --command` run in sessions isolated from AgentPlane,
+so application process-group signals cannot terminate the control server. Use
+`--kill-tree-on-terminate` when later termination must cover the whole isolated process group.
+
 Use `--accelerator-summary gpu|npu` on dry-runs to attach matched per-PID device index/name
 and used/total memory. Treat `available:false` as unknown occupancy, not zero occupancy.
 After a kill, run a fresh dry-run summary when device-memory release must be confirmed.

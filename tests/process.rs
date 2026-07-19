@@ -274,6 +274,81 @@ async fn process_session_round_trip_supports_stdin_env_cwd_and_timeout() -> Resu
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn process_terminate_delivers_sigterm_before_escalation() -> Result<()> {
+    let remote_root = tempfile::tempdir()?;
+    let state = ServerState::new(
+        "test-token".to_string(),
+        vec![remote_root.path().to_path_buf()],
+    );
+    let term_path = remote_root.path().join("sigterm-received");
+    let ready_path = remote_root.path().join("sigterm-ready");
+    let script = r#"
+import pathlib
+import signal
+import sys
+import time
+
+term_path = pathlib.Path(sys.argv[1])
+ready_path = pathlib.Path(sys.argv[2])
+
+def handle_term(_signum, _frame):
+    term_path.write_text("SIGTERM")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, handle_term)
+ready_path.write_text("ready")
+while True:
+    time.sleep(0.05)
+"#;
+
+    handle_process_start(
+        &state,
+        ProcessStartRequest {
+            remote_root: remote_root.path().display().to_string(),
+            process_id: "sigterm-handler".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                script.to_string(),
+                term_path.display().to_string(),
+                ready_path.display().to_string(),
+            ],
+            cwd: None,
+            env: Some(Default::default()),
+            claims: Vec::new(),
+            timeout_seconds: Some(10),
+            output_bytes_limit: None,
+            save_output_path: None,
+            pipe_stdin: false,
+            kill_tree_on_terminate: false,
+            run_id: None,
+        },
+    )
+    .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready_path.exists() {
+        if Instant::now() >= deadline {
+            anyhow::bail!("SIGTERM test process did not become ready");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    handle_process_terminate(
+        &state,
+        ProcessTerminateRequest {
+            process_id: "sigterm-handler".to_string(),
+            tree: false,
+        },
+    )
+    .await?;
+
+    assert_eq!(std::fs::read_to_string(term_path)?, "SIGTERM");
+    Ok(())
+}
+
 #[tokio::test]
 async fn process_cleanup_dry_run_reports_without_signaling_and_kill_requires_signal() -> Result<()>
 {
